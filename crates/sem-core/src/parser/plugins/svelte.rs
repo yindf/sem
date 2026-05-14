@@ -395,6 +395,7 @@ impl<'a> SvelteLowerer<'a> {
                 context.file_path,
                 &entity.entity_type,
                 &entity.name,
+                None,
                 Some(context.parent_id),
             );
             self.entities.push(entity);
@@ -601,10 +602,11 @@ impl<'a> SvelteLowerer<'a> {
         let entity_type = kind.as_str().to_string();
         let content = text_for_byte_range(self.source, start, end).to_string();
         SemanticEntity {
-            id: build_entity_id(self.file_path, &entity_type, &name, parent_id.as_deref()),
+            id: build_entity_id(self.file_path, &entity_type, &name, None, parent_id.as_deref()),
             file_path: self.file_path.to_string(),
             entity_type,
             name,
+            signature: None,
             parent_id,
             content_hash: content_hash(&content),
             structural_hash,
@@ -737,10 +739,11 @@ fn extract_svelte_module_entities(
 
     let entity_type = SvelteEntityKind::ModuleFile.as_str().to_string();
     let module_entity = SemanticEntity {
-        id: build_entity_id(file_path, &entity_type, "module", None),
+        id: build_entity_id(file_path, &entity_type, "module", None, None),
         file_path: file_path.to_string(),
         entity_type,
         name: "module".to_string(),
+        signature: None,
         parent_id: None,
         content_hash: content_hash(content),
         structural_hash: None,
@@ -756,7 +759,7 @@ fn extract_svelte_module_entities(
 
     for mut child in code_plugin.extract_entities(content, file_path) {
         child.parent_id = Some(module_id.clone());
-        child.id = build_entity_id(file_path, &child.entity_type, &child.name, Some(&module_id));
+        child.id = build_entity_id(file_path, &child.entity_type, &child.name, None, Some(&module_id));
         entities.push(child);
     }
 

@@ -29,10 +29,11 @@ impl SemanticParserPlugin for FallbackParserPlugin {
             let name = format!("lines {start_line}-{end_line}");
 
             entities.push(SemanticEntity {
-                id: build_entity_id(file_path, "chunk", &name, None),
+                id: build_entity_id(file_path, "chunk", &name, None, None),
                 file_path: file_path.to_string(),
                 entity_type: "chunk".to_string(),
                 name,
+                signature: None,
                 parent_id: None,
                 content_hash: content_hash(&chunk_content),
                 structural_hash: None,

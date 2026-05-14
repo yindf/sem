@@ -35,12 +35,13 @@ impl SemanticParserPlugin for ErbParserPlugin {
 
         // Top-level template entity
         let template_name = extract_template_name(file_path);
-        let template_id = build_entity_id(file_path, "template", &template_name, None);
+        let template_id = build_entity_id(file_path, "template", &template_name, None, None);
         entities.push(SemanticEntity {
             id: template_id.clone(),
             file_path: file_path.to_string(),
             entity_type: "template".to_string(),
             name: template_name,
+            signature: None,
             parent_id: None,
             content: content.to_string(),
             content_hash: content_hash(content),
@@ -77,11 +78,13 @@ impl SemanticParserPlugin for ErbParserPlugin {
                                 file_path,
                                 "erb_block",
                                 &name,
+                                None,
                                 Some(&template_id),
                             ),
                             file_path: file_path.to_string(),
                             entity_type: "erb_block".to_string(),
                             name,
+                            signature: None,
                             parent_id: Some(template_id.clone()),
                             content: block_content.clone(),
                             content_hash: content_hash(&block_content),
@@ -101,11 +104,13 @@ impl SemanticParserPlugin for ErbParserPlugin {
                             file_path,
                             "erb_expression",
                             &name,
+                            None,
                             Some(&template_id),
                         ),
                         file_path: file_path.to_string(),
                         entity_type: "erb_expression".to_string(),
                         name,
+                        signature: None,
                         parent_id: Some(template_id.clone()),
                         content: expr_content.clone(),
                         content_hash: content_hash(&expr_content),

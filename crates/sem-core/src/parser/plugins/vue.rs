@@ -21,10 +21,11 @@ impl SemanticParserPlugin for VueParserPlugin {
 
         for block in &blocks {
             let entity = SemanticEntity {
-                id: build_entity_id(file_path, "sfc_block", &block.name, None),
+                id: build_entity_id(file_path, "sfc_block", &block.name, None, None),
                 file_path: file_path.to_string(),
                 entity_type: "sfc_block".to_string(),
                 name: block.name.clone(),
+                signature: None,
                 parent_id: None,
                 content_hash: content_hash(&block.full_content),
                 structural_hash: None,
@@ -60,6 +61,7 @@ impl SemanticParserPlugin for VueParserPlugin {
                         file_path,
                         &child.entity_type,
                         &child.name,
+                        None,
                         child.parent_id.as_deref(),
                     );
                     entities.push(child);

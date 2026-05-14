@@ -52,11 +52,13 @@ fn visit_node(
                 let content_str = node_text(node, source);
                 let content = content_str.to_string();
                 let struct_hash = compute_structural_hash(node, source);
+                let signature = extract_signature(node, source);
                 let entity = SemanticEntity {
-                    id: build_entity_id(file_path, entity_type, &name, parent_id),
+                    id: build_entity_id(file_path, entity_type, &name, signature.as_deref(), parent_id),
                     file_path: file_path.to_string(),
                     entity_type: entity_type.to_string(),
                     name: name.clone(),
+                    signature,
                     parent_id: parent_id.map(String::from),
                     content_hash: content_hash(&content),
                     structural_hash: Some(struct_hash),
@@ -99,12 +101,14 @@ fn visit_node(
                     let content_str = node_text(binding, source);
                     let content = content_str.to_string();
                     let struct_hash = compute_structural_hash(binding, source);
+                    let signature = extract_signature(binding, source);
                     for name in names {
                         let entity = SemanticEntity {
-                            id: build_entity_id(file_path, entity_type, &name, parent_id),
+                            id: build_entity_id(file_path, entity_type, &name, signature.as_deref(), parent_id),
                             file_path: file_path.to_string(),
                             entity_type: entity_type.to_string(),
                             name,
+                            signature: signature.clone(),
                             parent_id: parent_id.map(String::from),
                             content_hash: content_hash(&content),
                             structural_hash: Some(struct_hash.clone()),
@@ -188,11 +192,14 @@ fn visit_node(
                         None => compute_structural_hash(node, source),
                     };
 
+                    let signature = extract_signature(node, source);
+
                     let entity = SemanticEntity {
-                        id: build_entity_id(file_path, entity_type, &name, parent_ref),
+                        id: build_entity_id(file_path, entity_type, &name, signature.as_deref(), parent_ref),
                         file_path: file_path.to_string(),
                         entity_type: entity_type.to_string(),
                         name: name.clone(),
+                        signature,
                         parent_id: parent_ref.map(String::from),
                         content_hash: content_hash(&content),
                         structural_hash: Some(struct_hash),
@@ -1424,11 +1431,13 @@ fn extract_ocaml_named_bindings(
             let content_str = node_text(binding, source);
             let content = content_str.to_string();
             let struct_hash = compute_structural_hash(binding, source);
+            let signature = extract_signature(binding, source);
             let entity = SemanticEntity {
-                id: build_entity_id(file_path, entity_type, &name, parent_id),
+                id: build_entity_id(file_path, entity_type, &name, signature.as_deref(), parent_id),
                 file_path: file_path.to_string(),
                 entity_type: entity_type.to_string(),
                 name: name.clone(),
+                signature,
                 parent_id: parent_id.map(String::from),
                 content_hash: content_hash(&content),
                 structural_hash: Some(struct_hash),
@@ -1499,4 +1508,227 @@ fn extract_go_receiver_struct(
         }
     }
     None
+}
+
+/// Extract a normalized parameter signature from an entity node for overload disambiguation.
+/// Returns a string like "(int,string)" or None when the node has no parameters.
+///
+/// Only extracts parameter *types*, not names, so that `fn foo(x: int, y: string)`
+/// and `fn foo(a: int, b: string)` produce the same signature.
+fn extract_signature(node: Node, source: &[u8]) -> Option<String> {
+    let node_type = node.kind();
+
+    // Skip non-function-like entities that never have parameters
+    if matches!(
+        node_type,
+        "class_declaration"
+        | "class_definition"
+        | "class_specifier"
+        | "interface_declaration"
+        | "struct_item"
+        | "struct_specifier"
+        | "struct_declaration"
+        | "enum_declaration"
+        | "enum_item"
+        | "enum_specifier"
+        | "impl_item"
+        | "trait_item"
+        | "mod_item"
+        | "module"
+        | "module_definition"
+        | "namespace_definition"
+        | "namespace_declaration"
+        | "type_alias_declaration"
+        | "type_declaration"
+        | "type_item"
+        | "type_definition"
+        | "type_alias"
+        | "lexical_declaration"
+        | "variable_declaration"
+        | "var_declaration"
+        | "const_declaration"
+        | "const_item"
+        | "static_item"
+        | "binding"
+        | "block"
+        | "decorated_definition"
+        | "template_declaration"
+        | "annotation_type_declaration"
+        | "field_declaration"
+        | "public_field_definition"
+        | "field_definition"
+        | "property_declaration"
+        | "export_statement"
+        | "package_statement"
+        | "inherit"
+        | "inherit_from"
+        | "mixin_declaration"
+        | "extension_declaration"
+        | "extension_type_declaration"
+        | "svelte_instance_script"
+        | "svelte_module_script"
+    ) {
+        return None;
+    }
+
+    // Try common parameter field names across languages
+    let params = node
+        .child_by_field_name("parameters")
+        .or_else(|| node.child_by_field_name("parameter_list"))
+        .or_else(|| node.child_by_field_name("formal_parameters"));
+
+    let params = match params {
+        Some(p) => p,
+        None => {
+            // C/C++ function_definition: parameters are inside the declarator
+            if node_type == "function_definition" {
+                if let Some(declarator) = node.child_by_field_name("declarator") {
+                    return extract_signature_from_declarator(declarator, source);
+                }
+            }
+            // C/C++ template_declaration: look for inner function/class
+            if node_type == "template_declaration" {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() != "template_parameter_list" {
+                        return extract_signature(child, source);
+                    }
+                }
+            }
+            // For call-based entities (Elixir), look for arguments
+            if node_type == "call" {
+                let mut cursor = node.walk();
+                let args = node.named_children(&mut cursor).find(|c| c.kind() == "arguments");
+                if let Some(args) = args {
+                    return extract_param_types_from_list(args, source);
+                }
+            }
+            return None;
+        }
+    };
+
+    extract_param_types_from_list(params, source)
+}
+
+/// Extract signature from a C-style declarator chain.
+fn extract_signature_from_declarator(mut node: Node, source: &[u8]) -> Option<String> {
+    loop {
+        match node.kind() {
+            "function_declarator" => {
+                // Parameters are in a parameter_list child
+                let mut cursor = node.walk();
+                if let Some(pl) = node.named_children(&mut cursor).find(|c| {
+                    c.kind() == "parameter_list"
+                        || c.kind() == "parameters"
+                }) {
+                    return extract_param_types_from_list(pl, source);
+                }
+                return None;
+            }
+            "pointer_declarator" | "parenthesized_declarator" | "array_declarator" => {
+                if let Some(inner) = node.child_by_field_name("declarator") {
+                    node = inner;
+                    continue;
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Extract parameter type names from a parameter list node, returning
+/// a normalized signature like "(int,string)".
+fn extract_param_types_from_list(params_node: Node, source: &[u8]) -> Option<String> {
+    let mut types: Vec<String> = Vec::new();
+    let mut cursor = params_node.walk();
+
+    for param in params_node.named_children(&mut cursor) {
+        let kind = param.kind();
+
+        // Skip non-parameter nodes (commas, annotations, etc.)
+        if matches!(kind, "," | "comment" | "line_comment" | "block_comment") {
+            continue;
+        }
+
+        // Many languages have a "type" field on parameter nodes
+        if let Some(type_node) = param.child_by_field_name("type") {
+            types.push(normalize_type_text(node_text(type_node, source)));
+            continue;
+        }
+
+        // Go parameters: type is the last child in parameter_declaration
+        if kind == "parameter_declaration" {
+            // Try "type" field first
+            if let Some(type_node) = param.child_by_field_name("type") {
+                types.push(normalize_type_text(node_text(type_node, source)));
+                continue;
+            }
+        }
+
+        // TypeScript/JavaScript: simple_identifier in formal_parameters, may have type_annotation
+        // e.g. `x: number` → parameter has name + type_annotation child
+        let mut inner_cursor = param.walk();
+        let children: Vec<_> = param.named_children(&mut inner_cursor).collect();
+
+        // Check for type_annotation among children
+        let mut found_type = false;
+        for child in &children {
+            if child.kind() == "type_annotation" {
+                if let Some(t) = child.named_children(&mut child.walk()).next() {
+                    types.push(normalize_type_text(node_text(t, source)));
+                    found_type = true;
+                    break;
+                }
+            }
+        }
+        if found_type {
+            continue;
+        }
+
+        // Python: `x: int = 5` → type is in a child with "type" field or type node
+        if kind == "typed_parameter" || kind == "default_parameter" || kind == "typed_default_parameter" {
+            if let Some(type_node) = param.child_by_field_name("type") {
+                types.push(normalize_type_text(node_text(type_node, source)));
+                continue;
+            }
+        }
+
+        // If no type info found, use "_" as placeholder for untyped parameters
+        if !kind.contains("comment") && kind != "self_parameter" && kind != "rest_parameter" {
+            // For rest parameters like ...args, use "..._"
+            if kind == "spread_parameter" || kind == "rest_parameter" {
+                types.push("..._".to_string());
+            } else if kind == "dictionary_parameter" || kind == "dictionary_splat_parameter" {
+                types.push("**_".to_string());
+            } else {
+                types.push("_".to_string());
+            }
+        }
+    }
+
+    if types.is_empty() {
+        return None;
+    }
+
+    Some(format!("({})", types.join(",")))
+}
+
+/// Normalize a type string: collapse whitespace, trim.
+fn normalize_type_text(text: &str) -> String {
+    // Collapse consecutive whitespace to single space, trim
+    let mut result = String::with_capacity(text.len());
+    let mut prev_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                result.push(' ');
+                prev_space = true;
+            }
+        } else {
+            result.push(ch);
+            prev_space = false;
+        }
+    }
+    result.trim().to_string()
 }

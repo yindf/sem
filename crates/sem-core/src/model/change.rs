@@ -9,6 +9,7 @@ pub enum ChangeType {
     Moved,
     Renamed,
     Reordered,
+    SignatureChanged,
 }
 
 impl std::fmt::Display for ChangeType {
@@ -20,6 +21,7 @@ impl std::fmt::Display for ChangeType {
             ChangeType::Moved => write!(f, "moved"),
             ChangeType::Renamed => write!(f, "renamed"),
             ChangeType::Reordered => write!(f, "reordered"),
+            ChangeType::SignatureChanged => write!(f, "signature_changed"),
         }
     }
 }
@@ -40,6 +42,9 @@ pub struct SemanticChange {
     pub file_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_entity_name: Option<String>,
+    /// Previous signature before a signature change (Phase 1.5 detection).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_file_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

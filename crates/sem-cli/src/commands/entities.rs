@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use colored::Colorize;
@@ -39,15 +39,21 @@ pub fn entities_command(opts: EntitiesOptions) {
     };
 
     if opts.json {
+        let overload_keys = collect_overload_keys(&entities);
         let output: Vec<_> = entities
             .iter()
-            .map(|e| entity_json(e, include_file))
+            .map(|e| {
+                let is_overload = overload_keys.contains(&entity_logical_key(e));
+                entity_json(e, include_file, is_overload)
+            })
             .collect();
         println!("{}", serde_json::to_string(&output).unwrap());
     } else if should_group_by_file(&entities) {
-        print_grouped_entities(&path_label, &entities);
+        let overload_keys = collect_overload_keys(&entities);
+        print_grouped_entities(&path_label, &entities, &overload_keys);
     } else if let Some(file_path) = entities.first().map(|e| e.file_path.as_str()) {
-        print_file_entities(file_path, &entities);
+        let overload_keys = collect_overload_keys(&entities);
+        print_file_entities(file_path, &entities, &overload_keys);
     } else {
         println!("{} {}\n", "entities:".green().bold(), path_label.bold());
     }
@@ -152,7 +158,27 @@ fn extract_file_entities(
     Ok(registry.extract_entities(file_path, &content))
 }
 
-fn entity_json(entity: &SemanticEntity, include_file: bool) -> serde_json::Value {
+/// Compute the set of logical keys that have overloads (multiple entities with same file+parent+name).
+fn collect_overload_keys(entities: &[SemanticEntity]) -> BTreeSet<String> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for e in entities {
+        let key = match &e.parent_id {
+            Some(p) => format!("{}::{}::{}", e.file_path, p, e.name),
+            None => format!("{}::{}::{}", e.file_path, e.entity_type, e.name),
+        };
+        *counts.entry(key).or_default() += 1;
+    }
+    counts.into_iter().filter(|(_, c)| *c > 1).map(|(k, _)| k).collect()
+}
+
+fn entity_logical_key(entity: &SemanticEntity) -> String {
+    match &entity.parent_id {
+        Some(p) => format!("{}::{}::{}", entity.file_path, p, entity.name),
+        None => format!("{}::{}::{}", entity.file_path, entity.entity_type, entity.name),
+    }
+}
+
+fn entity_json(entity: &SemanticEntity, include_file: bool, is_overload: bool) -> serde_json::Value {
     let mut value = serde_json::json!({
         "name": entity.name,
         "type": entity.entity_type,
@@ -165,12 +191,18 @@ fn entity_json(entity: &SemanticEntity, include_file: bool) -> serde_json::Value
         value["file"] = serde_json::json!(entity.file_path);
     }
 
+    if is_overload {
+        if let Some(sig) = &entity.signature {
+            value["signature"] = serde_json::Value::String(sig.clone());
+        }
+    }
+
     value
 }
 
-fn print_file_entities(file_path: &str, entities: &[SemanticEntity]) {
+fn print_file_entities(file_path: &str, entities: &[SemanticEntity], overload_keys: &BTreeSet<String>) {
     println!("{} {}\n", "entities:".green().bold(), file_path.bold());
-    print_entity_rows(entities, "  ");
+    print_entity_rows(entities, "  ", overload_keys);
 }
 
 fn should_group_by_file(entities: &[SemanticEntity]) -> bool {
@@ -178,7 +210,7 @@ fn should_group_by_file(entities: &[SemanticEntity]) -> bool {
     files.len() > 1
 }
 
-fn print_grouped_entities(path_label: &str, entities: &[SemanticEntity]) {
+fn print_grouped_entities(path_label: &str, entities: &[SemanticEntity], overload_keys: &BTreeSet<String>) {
     println!("{} {}\n", "entities:".green().bold(), path_label.bold());
 
     let mut current_file: Option<&str> = None;
@@ -193,27 +225,38 @@ fn print_grouped_entities(path_label: &str, entities: &[SemanticEntity]) {
         } else {
             "    "
         };
-        print_entity_row(entity, indent);
+        let is_overload = overload_keys.contains(&entity_logical_key(entity));
+        print_entity_row(entity, indent, is_overload);
     }
 }
 
-fn print_entity_rows(entities: &[SemanticEntity], base_indent: &str) {
+fn print_entity_rows(entities: &[SemanticEntity], base_indent: &str, overload_keys: &BTreeSet<String>) {
     for entity in entities {
         let indent = if entity.parent_id.is_some() {
             format!("{base_indent}  ")
         } else {
             base_indent.to_string()
         };
-        print_entity_row(entity, &indent);
+        let is_overload = overload_keys.contains(&entity_logical_key(entity));
+        print_entity_row(entity, &indent, is_overload);
     }
 }
 
-fn print_entity_row(entity: &SemanticEntity, indent: &str) {
+fn print_entity_row(entity: &SemanticEntity, indent: &str, is_overload: bool) {
+    let sig_display = if is_overload {
+        match &entity.signature {
+            Some(sig) => format!("{}", sig.dimmed()),
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
     println!(
-        "{}{} {} (L{}:{})",
+        "{}{} {}{} (L{}:{})",
         indent,
         entity.entity_type.dimmed(),
         entity.name.bold(),
+        sig_display,
         entity.start_line,
         entity.end_line,
     );

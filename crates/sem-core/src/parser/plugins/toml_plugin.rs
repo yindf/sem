@@ -60,10 +60,11 @@ impl SemanticParserPlugin for TomlParserPlugin {
             };
 
             entities.push(SemanticEntity {
-                id: build_entity_id(file_path, entity_type, &section.key, None),
+                id: build_entity_id(file_path, entity_type, &section.key, None, None),
                 file_path: file_path.to_string(),
                 entity_type: entity_type.to_string(),
                 name: section.key.clone(),
+                signature: None,
                 parent_id: None,
                 content_hash: content_hash(&value_str),
                 structural_hash: None,

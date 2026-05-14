@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use colored::Colorize;
@@ -6,6 +7,27 @@ use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::registry::ParserRegistry;
 
 use super::truncate_str;
+
+/// Parsed entity query: "Name" or "Name(Signature)".
+struct EntityQuery {
+    name: String,
+    signature: Option<String>,
+}
+
+fn parse_entity_query(input: &str) -> EntityQuery {
+    if let Some(open) = input.rfind('(') {
+        if input.ends_with(')') && open > 0 {
+            return EntityQuery {
+                name: input[..open].to_string(),
+                signature: Some(input[open..].to_string()),
+            };
+        }
+    }
+    EntityQuery {
+        name: input.to_string(),
+        signature: None,
+    }
+}
 
 pub struct LogOptions {
     pub cwd: String,
@@ -24,6 +46,8 @@ enum EntityChangeType {
     Deleted,
     Moved,
     Reappeared,
+    SignatureChanged,
+    Renamed,
 }
 
 impl EntityChangeType {
@@ -35,6 +59,8 @@ impl EntityChangeType {
             EntityChangeType::Deleted => "deleted",
             EntityChangeType::Moved => "moved",
             EntityChangeType::Reappeared => "reappeared",
+            EntityChangeType::SignatureChanged => "signature",
+            EntityChangeType::Renamed => "renamed",
         }
     }
 
@@ -46,6 +72,8 @@ impl EntityChangeType {
             EntityChangeType::Deleted => "deleted".red(),
             EntityChangeType::Moved => "moved".blue(),
             EntityChangeType::Reappeared => "reappeared".green(),
+            EntityChangeType::SignatureChanged => "signature".magenta(),
+            EntityChangeType::Renamed => "renamed".cyan(),
         }
     }
 }
@@ -60,11 +88,14 @@ struct LogEntry {
     prev_content: Option<String>,
     file_path: Option<String>,
     prev_file_path: Option<String>,
+    old_name: Option<String>,
+    old_signature: Option<String>,
 }
 
 pub fn log_command(opts: LogOptions) {
     let root = Path::new(&opts.cwd);
     let registry = super::create_registry(&opts.cwd);
+    let query = parse_entity_query(&opts.entity_name);
 
     let bridge = match GitBridge::open(root) {
         Ok(b) => b,
@@ -77,7 +108,7 @@ pub fn log_command(opts: LogOptions) {
     // Resolve file path: use provided or auto-detect
     let file_path = match opts.file_path {
         Some(fp) => fp,
-        None => match find_entity_file(root, &registry, &opts.entity_name) {
+        None => match find_entity_file(root, &registry, &query) {
             FindResult::Found(fp) => fp,
             FindResult::Ambiguous(files) => {
                 eprintln!(
@@ -132,6 +163,9 @@ pub fn log_command(opts: LogOptions) {
     let mut entries: Vec<LogEntry> = Vec::new();
     let mut prev_entity_content: Option<String> = None;
     let mut prev_structural_hash: Option<String> = None;
+    let mut prev_content_hash: Option<String> = None;
+    let mut prev_entity_name: String = query.name.clone();
+    let mut prev_entity_signature: Option<String> = query.signature.clone();
     let mut entity_type = String::new();
     let mut found_at_least_once = false;
     let mut total_commits = 0usize;
@@ -177,22 +211,34 @@ pub fn log_command(opts: LogOptions) {
                 .ok()
                 .flatten();
 
-            let found_entity = file_content.as_ref().and_then(|c| {
-                let entities = registry.extract_entities(&current_git_file, c);
-                entities.into_iter().find(|e| e.name == opts.entity_name)
-            });
+            let commit_entities: Vec<SemanticEntity> = file_content
+                .as_ref()
+                .map(|c| registry.extract_entities(&current_git_file, c))
+                .unwrap_or_default();
+
+            let found_match = find_entity_in_commit(
+                &commit_entities,
+                &prev_entity_name,
+                prev_entity_signature.as_deref(),
+                &prev_entity_name,
+                prev_entity_signature.as_deref(),
+                prev_content_hash.as_deref(),
+                prev_structural_hash.as_deref(),
+                prev_entity_content.as_deref(),
+            );
 
             let date = chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0));
             let msg_first_line = commit.message.lines().next().unwrap_or("").to_string();
 
-            match found_entity {
-                Some(ent) => {
+            match found_match {
+                Some(m) => {
+                    let ent = m.entity;
                     if !found_at_least_once {
                         entity_type = ent.entity_type.clone();
                     }
 
-                    let cur_content_hash = &ent.content_hash;
-                    let cur_structural_hash = ent.structural_hash.as_deref();
+                    let cur_content_hash = ent.content_hash.clone();
+                    let cur_structural_hash = ent.structural_hash.clone();
 
                     if !found_at_least_once {
                         found_at_least_once = true;
@@ -206,6 +252,8 @@ pub fn log_command(opts: LogOptions) {
                             prev_content: None,
                             file_path: Some(current_git_file.clone()),
                             prev_file_path: None,
+                            old_name: None,
+                            old_signature: None,
                         });
                     } else if prev_entity_content.is_none() {
                         entries.push(LogEntry {
@@ -218,71 +266,100 @@ pub fn log_command(opts: LogOptions) {
                             prev_content: None,
                             file_path: Some(current_git_file.clone()),
                             prev_file_path: None,
+                            old_name: None,
+                            old_signature: None,
                         });
                     } else {
-                        let prev_hash = prev_entity_content
-                            .as_ref()
-                            .map(|c| sem_core::utils::hash::content_hash(c));
-                        let content_changed =
-                            prev_hash.as_deref() != Some(cur_content_hash.as_str());
+                        // Determine change type
+                        let change_type = if let Some(mt) = m.match_type {
+                            mt
+                        } else {
+                            // Identity-preserved match: check content change
+                            let content_changed =
+                                prev_content_hash.as_deref() != Some(cur_content_hash.as_str());
 
-                        if content_changed {
-                            let structural_changed =
-                                match (cur_structural_hash, prev_structural_hash.as_deref()) {
-                                    (Some(cur), Some(prev)) => cur != prev,
-                                    _ => true,
-                                };
-                            let change_type = if structural_changed {
-                                EntityChangeType::ModifiedLogic
+                            if content_changed {
+                                let structural_changed =
+                                    match (cur_structural_hash.as_deref(), prev_structural_hash.as_deref()) {
+                                        (Some(cur), Some(prev)) => cur != prev,
+                                        _ => true,
+                                    };
+                                if structural_changed {
+                                    EntityChangeType::ModifiedLogic
+                                } else {
+                                    EntityChangeType::ModifiedCosmetic
+                                }
                             } else {
-                                EntityChangeType::ModifiedCosmetic
-                            };
-                            entries.push(LogEntry {
-                                short_sha: commit.short_sha.clone(),
-                                author: commit.author.clone(),
-                                date,
-                                message: msg_first_line,
-                                change_type,
-                                content: Some(ent.content.clone()),
-                                prev_content: prev_entity_content.clone(),
-                                file_path: Some(current_git_file.clone()),
-                                prev_file_path: None,
-                            });
-                        }
+                                // No change — skip this commit
+                                prev_entity_content = Some(ent.content.clone());
+                                prev_structural_hash = cur_structural_hash.clone();
+                                prev_content_hash = Some(cur_content_hash.clone());
+                                prev_entity_name = ent.name.clone();
+                                prev_entity_signature = ent.signature.clone();
+                                continue;
+                            }
+                        };
+
+                        entries.push(LogEntry {
+                            short_sha: commit.short_sha.clone(),
+                            author: commit.author.clone(),
+                            date,
+                            message: msg_first_line,
+                            change_type,
+                            content: Some(ent.content.clone()),
+                            prev_content: prev_entity_content.clone(),
+                            file_path: Some(current_git_file.clone()),
+                            prev_file_path: None,
+                            old_name: m.old_name,
+                            old_signature: m.old_signature,
+                        });
                     }
 
                     prev_entity_content = Some(ent.content.clone());
                     prev_structural_hash = ent.structural_hash.clone();
+                    prev_content_hash = Some(ent.content_hash.clone());
+                    prev_entity_name = ent.name.clone();
+                    prev_entity_signature = ent.signature.clone();
                 }
                 None => {
-                    // Entity not in tracked file. Try cross-file search.
+                    // Entity not in tracked file.
                     if prev_entity_content.is_some() {
-                        let cross = search_entity_cross_file(
+                        // Already tracking — try cross-file search
+                        let cross = search_entity_cross_file_v2(
                             &bridge,
                             &registry,
                             &commit.sha,
-                            &opts.entity_name,
+                            &prev_entity_name,
+                            prev_entity_signature.as_deref(),
+                            prev_content_hash.as_deref(),
                             prev_structural_hash.as_deref(),
+                            &prev_entity_name,
+                            prev_entity_signature.as_deref(),
                             &current_git_file,
                         );
 
                         match cross {
-                            Some((new_file, ent)) => {
+                            Some((new_file, ent, change_type, old_name, old_signature)) => {
                                 let prev_file = current_git_file.clone();
                                 entries.push(LogEntry {
                                     short_sha: commit.short_sha.clone(),
                                     author: commit.author.clone(),
                                     date,
                                     message: msg_first_line,
-                                    change_type: EntityChangeType::Moved,
+                                    change_type,
                                     content: Some(ent.content.clone()),
                                     prev_content: prev_entity_content.clone(),
                                     file_path: Some(new_file.clone()),
                                     prev_file_path: Some(prev_file),
+                                    old_name,
+                                    old_signature,
                                 });
 
                                 prev_entity_content = Some(ent.content.clone());
                                 prev_structural_hash = ent.structural_hash.clone();
+                                prev_content_hash = Some(ent.content_hash.clone());
+                                prev_entity_name = ent.name.clone();
+                                prev_entity_signature = ent.signature.clone();
                                 skip_until_sha = Some(commit.sha.clone());
                                 current_git_file = new_file;
                                 moved = true;
@@ -299,9 +376,39 @@ pub fn log_command(opts: LogOptions) {
                                     prev_content: prev_entity_content.take(),
                                     file_path: Some(current_git_file.clone()),
                                     prev_file_path: None,
+                                    old_name: None,
+                                    old_signature: None,
                                 });
                                 prev_structural_hash = None;
+                                prev_content_hash = None;
                             }
+                        }
+                    } else if query.signature.is_some() {
+                        // Not yet tracking. Try to find a predecessor: same name,
+                        // different signature, matching parameter count.
+                        // This handles the case where the user queries by the NEW signature
+                        // but the entity previously had a different signature.
+                        if let Some(pred) = find_predecessor(&commit_entities, &query.name, query.signature.as_deref()) {
+                            found_at_least_once = true;
+                            entity_type = pred.entity_type.clone();
+                            entries.push(LogEntry {
+                                short_sha: commit.short_sha.clone(),
+                                author: commit.author.clone(),
+                                date,
+                                message: msg_first_line,
+                                change_type: EntityChangeType::Added,
+                                content: Some(pred.content.clone()),
+                                prev_content: None,
+                                file_path: Some(current_git_file.clone()),
+                                prev_file_path: None,
+                                old_name: None,
+                                old_signature: None,
+                            });
+                            prev_entity_content = Some(pred.content.clone());
+                            prev_structural_hash = pred.structural_hash.clone();
+                            prev_content_hash = Some(pred.content_hash.clone());
+                            prev_entity_name = pred.name.clone();
+                            prev_entity_signature = pred.signature.clone();
                         }
                     }
                 }
@@ -343,14 +450,14 @@ pub fn log_command(opts: LogOptions) {
         });
 
     if opts.json {
-        print_json(&opts.entity_name, &display_file, &entity_type, &entries, opts.verbose);
+        print_json(&query, &display_file, &entity_type, &entries, opts.verbose);
     } else {
-        print_terminal(&opts.entity_name, &display_file, was_file.as_deref(), &entity_type, &entries, total_commits, &first_seen, opts.verbose);
+        print_terminal(&query, &display_file, was_file.as_deref(), &entity_type, &entries, total_commits, &first_seen, opts.verbose);
     }
 }
 
 fn print_terminal(
-    entity_name: &str,
+    query: &EntityQuery,
     file_path: &str,
     was_file: Option<&str>,
     entity_type: &str,
@@ -359,13 +466,17 @@ fn print_terminal(
     first_seen: &str,
     verbose: bool,
 ) {
+    let entity_display = match &query.signature {
+        Some(sig) => format!("{}{}", query.name, sig),
+        None => query.name.clone(),
+    };
     let header = if let Some(prev) = was_file {
         format!(
             "┌─ {} :: {} :: {}  (was: {})",
-            file_path, entity_type, entity_name, prev
+            file_path, entity_type, entity_display, prev
         )
     } else {
-        format!("┌─ {} :: {} :: {}", file_path, entity_type, entity_name)
+        format!("┌─ {} :: {} :: {}", file_path, entity_type, entity_display)
     };
     println!("{}", header.bold());
     println!("│");
@@ -373,19 +484,24 @@ fn print_terminal(
     let max_author_len = entries.iter().map(|e| e.author.len()).max().unwrap_or(6);
     let max_change_len = entries
         .iter()
-        .map(|e| e.change_type.label().len())
+        .map(|e| {
+            let label = compute_display_label(e);
+            label.len()
+        })
         .max()
         .unwrap_or(10);
 
     for entry in entries {
         let msg_short = truncate_str(&entry.message, 50);
+        let display_label = compute_display_label(entry);
+        let display_colored = compute_display_label_colored(entry);
 
         println!(
             "│  {}  {:<max_author$}  {}  {:<max_change$}  {}",
             entry.short_sha.yellow(),
             entry.author.cyan(),
             entry.date.dimmed(),
-            entry.change_type.label_colored(),
+            display_colored,
             msg_short,
             max_author = max_author_len,
             max_change = max_change_len,
@@ -397,6 +513,42 @@ fn print_terminal(
                 println!(
                     "│    {}",
                     format!("→ moved to {}", new_fp).blue()
+                );
+            }
+        }
+
+        // Show signature change details
+        if matches!(entry.change_type, EntityChangeType::SignatureChanged) {
+            if let Some(old_sig) = &entry.old_signature {
+                println!(
+                    "│    {}",
+                    format!("→ signature {}", old_sig).magenta()
+                );
+            }
+        }
+
+        // Show rename details
+        if matches!(entry.change_type, EntityChangeType::Renamed) {
+            if let Some(old_name) = &entry.old_name {
+                println!(
+                    "│    {}",
+                    format!("→ renamed {} → ...", old_name).cyan()
+                );
+            }
+        }
+
+        // Show combined moved + signature/rename details
+        if matches!(entry.change_type, EntityChangeType::Moved) {
+            if let Some(old_sig) = &entry.old_signature {
+                println!(
+                    "│    {}",
+                    format!("→ signature {}", old_sig).magenta()
+                );
+            }
+            if let Some(old_name) = &entry.old_name {
+                println!(
+                    "│    {}",
+                    format!("→ renamed {}", old_name).cyan()
                 );
             }
         }
@@ -427,6 +579,41 @@ fn print_terminal(
     println!("└{}", "─".repeat(60));
 }
 
+/// Compute the display label for a log entry, handling combined types like "moved + signature".
+fn compute_display_label(entry: &LogEntry) -> String {
+    match &entry.change_type {
+        EntityChangeType::Moved => {
+            if entry.old_signature.is_some() && entry.old_name.is_some() {
+                "moved + renamed + signature".to_string()
+            } else if entry.old_signature.is_some() {
+                "moved + signature".to_string()
+            } else if entry.old_name.is_some() {
+                "moved + renamed".to_string()
+            } else {
+                "moved".to_string()
+            }
+        }
+        other => other.label().to_string(),
+    }
+}
+
+fn compute_display_label_colored(entry: &LogEntry) -> colored::ColoredString {
+    match &entry.change_type {
+        EntityChangeType::Moved => {
+            if entry.old_signature.is_some() && entry.old_name.is_some() {
+                "moved + renamed + signature".blue().to_string().normal()
+            } else if entry.old_signature.is_some() {
+                "moved + signature".blue().to_string().normal()
+            } else if entry.old_name.is_some() {
+                "moved + renamed".blue().to_string().normal()
+            } else {
+                "moved".blue()
+            }
+        }
+        other => other.label_colored(),
+    }
+}
+
 fn print_inline_diff(before: &str, after: &str) {
     use similar::TextDiff;
 
@@ -452,8 +639,332 @@ fn print_inline_diff(before: &str, after: &str) {
     }
 }
 
+/// Result of matching an entity at a specific commit.
+struct MatchedEntity {
+    entity: SemanticEntity,
+    /// Whether this was a SignatureChanged or Renamed match (vs identity-preserved).
+    match_type: Option<EntityChangeType>,
+    old_name: Option<String>,
+    old_signature: Option<String>,
+}
+
+/// Compute Jaccard token similarity between two strings.
+fn jaccard_similarity(a: &str, b: &str) -> f64 {
+    let set_a: std::collections::BTreeSet<&str> = a.split_whitespace().collect();
+    let set_b: std::collections::BTreeSet<&str> = b.split_whitespace().collect();
+    if set_a.is_empty() && set_b.is_empty() {
+        return 1.0;
+    }
+    let intersection = set_a.intersection(&set_b).count();
+    let union = set_a.union(&set_b).count();
+    intersection as f64 / union as f64
+}
+
+/// Multi-strategy entity finder that handles overloads, signature changes, and renames.
+///
+/// Priority:
+/// Phase A: Exact (name, signature) match
+/// Phase B: SignatureChanged — same name, different signature, content similarity
+/// Phase C: Renamed — different name, content/structure matches
+fn find_entity_in_commit(
+    entities: &[SemanticEntity],
+    query_name: &str,
+    query_signature: Option<&str>,
+    prev_name: &str,
+    prev_signature: Option<&str>,
+    prev_content_hash: Option<&str>,
+    prev_structural_hash: Option<&str>,
+    prev_entity_content: Option<&str>,
+) -> Option<MatchedEntity> {
+    // Build lookup maps for Phase B/C (only needed if we have previous state)
+    let content_map: HashMap<&str, &SemanticEntity> = if prev_content_hash.is_some() {
+        entities.iter().map(|e| (e.content_hash.as_str(), e)).collect()
+    } else {
+        HashMap::new()
+    };
+    let struct_map: HashMap<&str, &SemanticEntity> = if prev_structural_hash.is_some() {
+        entities
+            .iter()
+            .filter_map(|e| e.structural_hash.as_deref().map(|h| (h, e)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
+    // Phase A: Exact (name, signature) match
+    if let Some(sig) = query_signature {
+        // Exact signature match
+        if let Some(ent) = entities.iter().find(|e| e.name == query_name && e.signature.as_deref() == Some(sig)) {
+            return Some(MatchedEntity {
+                entity: ent.clone(),
+                match_type: None,
+                old_name: None,
+                old_signature: None,
+            });
+        }
+    } else {
+        // No signature constraint — match by name, disambiguate by content
+        let by_name: Vec<&SemanticEntity> = entities.iter().filter(|e| e.name == query_name).collect();
+        if by_name.len() == 1 {
+            return Some(MatchedEntity {
+                entity: by_name[0].clone(),
+                match_type: None,
+                old_name: None,
+                old_signature: None,
+            });
+        }
+        if !by_name.is_empty() {
+            if let Some(pch) = prev_content_hash {
+                if let Some(ent) = by_name.iter().find(|e| e.content_hash == pch) {
+                    return Some(MatchedEntity {
+                        entity: (*ent).clone(),
+                        match_type: None,
+                        old_name: None,
+                        old_signature: None,
+                    });
+                }
+            }
+            if let Some(psh) = prev_structural_hash {
+                if let Some(ent) = by_name.iter().find(|e| e.structural_hash.as_deref() == Some(psh)) {
+                    return Some(MatchedEntity {
+                        entity: (*ent).clone(),
+                        match_type: None,
+                        old_name: None,
+                        old_signature: None,
+                    });
+                }
+            }
+            // Fallback: first by name (backward compat)
+            return Some(MatchedEntity {
+                entity: by_name[0].clone(),
+                match_type: None,
+                old_name: None,
+                old_signature: None,
+            });
+        }
+    }
+
+    // Phase B: SignatureChanged — same name, different signature
+    // 1. Try exact content/structural hash match (body unchanged, only signature changed)
+    // 2. Fall back to Jaccard token similarity (body slightly changed due to param type)
+    let sig_candidates: Vec<&SemanticEntity> = entities
+        .iter()
+        .filter(|e| e.name == query_name && e.signature.as_deref() != query_signature)
+        .collect();
+
+    if !sig_candidates.is_empty() {
+        // Try exact hash match first
+        if let Some(pch) = prev_content_hash {
+            if let Some(ent) = sig_candidates.iter().find(|e| e.content_hash == pch) {
+                return Some(MatchedEntity {
+                    entity: (*ent).clone(),
+                    match_type: Some(EntityChangeType::SignatureChanged),
+                    old_name: None,
+                    old_signature: prev_signature.map(|s| s.to_string()),
+                });
+            }
+        }
+        if let Some(psh) = prev_structural_hash {
+            if let Some(ent) = sig_candidates.iter().find(|e| e.structural_hash.as_deref() == Some(psh)) {
+                return Some(MatchedEntity {
+                    entity: (*ent).clone(),
+                    match_type: Some(EntityChangeType::SignatureChanged),
+                    old_name: None,
+                    old_signature: prev_signature.map(|s| s.to_string()),
+                });
+            }
+        }
+        // Fallback: Jaccard similarity with prev content
+        if let Some(prev_content) = prev_entity_content {
+            let best = sig_candidates
+                .iter()
+                .map(|e| (e, jaccard_similarity(prev_content, &e.content)))
+                .filter(|(_, score)| *score >= 0.5)
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            if let Some((ent, _score)) = best {
+                return Some(MatchedEntity {
+                    entity: (*ent).clone(),
+                    match_type: Some(EntityChangeType::SignatureChanged),
+                    old_name: None,
+                    old_signature: prev_signature.map(|s| s.to_string()),
+                });
+            }
+        }
+    }
+
+    // Phase C: Renamed — different name, content/structure matches
+    if prev_content_hash.is_some() || prev_structural_hash.is_some() {
+        if let Some(pch) = prev_content_hash {
+            if let Some(ent) = content_map.get(pch) {
+                if ent.name != query_name {
+                    return Some(MatchedEntity {
+                        entity: (*ent).clone(),
+                        match_type: Some(EntityChangeType::Renamed),
+                        old_name: Some(prev_name.to_string()),
+                        old_signature: None,
+                    });
+                }
+            }
+        }
+        if let Some(psh) = prev_structural_hash {
+            if let Some(ent) = struct_map.get(psh) {
+                if ent.name != query_name {
+                    return Some(MatchedEntity {
+                        entity: (*ent).clone(),
+                        match_type: Some(EntityChangeType::Renamed),
+                        old_name: Some(prev_name.to_string()),
+                        old_signature: None,
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Find a predecessor entity: same name, different signature.
+/// Used when the user queries by the NEW signature but the entity previously
+/// had a different signature. Picks the candidate with matching parameter count.
+fn find_predecessor<'a>(
+    entities: &'a [SemanticEntity],
+    query_name: &str,
+    query_signature: Option<&str>,
+) -> Option<&'a SemanticEntity> {
+    let query_param_count = query_signature.map(|s| s.matches(',').count() + 1);
+
+    let candidates: Vec<&SemanticEntity> = entities
+        .iter()
+        .filter(|e| e.name == query_name && e.signature.is_some() && e.signature.as_deref() != query_signature)
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Prefer candidate with matching parameter count
+    if let Some(target_count) = query_param_count {
+        if let Some(best) = candidates.iter().find(|e| {
+            e.signature
+                .as_ref()
+                .map(|s| s.matches(',').count() + 1)
+                == Some(target_count)
+        }) {
+            return Some(best);
+        }
+    }
+
+    // Fallback: first candidate
+    candidates.into_iter().next()
+}
+
+/// Cross-file entity search with overload awareness.
+///
+/// Returns (file_path, entity, change_type, old_name, old_signature).
+fn search_entity_cross_file_v2(
+    bridge: &GitBridge,
+    registry: &ParserRegistry,
+    sha: &str,
+    query_name: &str,
+    query_signature: Option<&str>,
+    prev_content_hash: Option<&str>,
+    prev_structural_hash: Option<&str>,
+    prev_name: &str,
+    prev_signature: Option<&str>,
+    exclude_file: &str,
+) -> Option<(String, SemanticEntity, EntityChangeType, Option<String>, Option<String>)> {
+    let changed_files = bridge.get_commit_changed_files(sha).ok()?;
+
+    // Pass 1: Exact (name, signature) in other files → Moved
+    for file_path in &changed_files {
+        if file_path == exclude_file {
+            continue;
+        }
+        let content = match bridge.read_file_at_ref(sha, file_path) {
+            Ok(Some(c)) => c,
+            _ => continue,
+        };
+        let entities = registry.extract_entities(file_path, &content);
+        let found = if let Some(sig) = query_signature {
+            entities.into_iter().find(|e| e.name == query_name && e.signature.as_deref() == Some(sig))
+        } else {
+            entities.into_iter().find(|e| e.name == query_name)
+        };
+        if let Some(ent) = found {
+            return Some((file_path.clone(), ent, EntityChangeType::Moved, None, None));
+        }
+    }
+
+    // Pass 2: Same name, different signature + content/structure match → Moved + SignatureChanged
+    if prev_content_hash.is_some() || prev_structural_hash.is_some() {
+        for file_path in &changed_files {
+            if file_path == exclude_file {
+                continue;
+            }
+            let content = match bridge.read_file_at_ref(sha, file_path) {
+                Ok(Some(c)) => c,
+                _ => continue,
+            };
+            let entities = registry.extract_entities(file_path, &content);
+            for ent in &entities {
+                if ent.name != query_name {
+                    continue;
+                }
+                let content_match = prev_content_hash.map_or(false, |pch| ent.content_hash == pch);
+                let struct_match = prev_structural_hash.map_or(false, |psh| {
+                    ent.structural_hash.as_deref() == Some(psh)
+                });
+                if content_match || struct_match {
+                    return Some((
+                        file_path.clone(),
+                        ent.clone(),
+                        EntityChangeType::Moved,
+                        None,
+                        prev_signature.map(|s| s.to_string()),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Pass 3: Different name + content/structure match → Moved + Renamed
+    if prev_content_hash.is_some() || prev_structural_hash.is_some() {
+        for file_path in &changed_files {
+            if file_path == exclude_file {
+                continue;
+            }
+            let content = match bridge.read_file_at_ref(sha, file_path) {
+                Ok(Some(c)) => c,
+                _ => continue,
+            };
+            let entities = registry.extract_entities(file_path, &content);
+            for ent in &entities {
+                if ent.name == query_name {
+                    continue;
+                }
+                let content_match = prev_content_hash.map_or(false, |pch| ent.content_hash == pch);
+                let struct_match = prev_structural_hash.map_or(false, |psh| {
+                    ent.structural_hash.as_deref() == Some(psh)
+                });
+                if content_match || struct_match {
+                    return Some((
+                        file_path.clone(),
+                        ent.clone(),
+                        EntityChangeType::Moved,
+                        Some(prev_name.to_string()),
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn print_json(
-    entity_name: &str,
+    query: &EntityQuery,
     file_path: &str,
     entity_type: &str,
     entries: &[LogEntry],
@@ -469,7 +980,7 @@ fn print_json(
                     "date": e.date,
                     "message": e.message,
                 },
-                "change_type": e.change_type.label(),
+                "change_type": compute_display_label(e),
                 "structural_change": matches!(e.change_type, EntityChangeType::ModifiedLogic | EntityChangeType::Added),
             });
 
@@ -478,6 +989,12 @@ fn print_json(
             }
             if let Some(pfp) = &e.prev_file_path {
                 obj["prev_file_path"] = serde_json::Value::String(pfp.clone());
+            }
+            if let Some(on) = &e.old_name {
+                obj["old_name"] = serde_json::Value::String(on.clone());
+            }
+            if let Some(os) = &e.old_signature {
+                obj["old_signature"] = serde_json::Value::String(os.clone());
             }
 
             if verbose {
@@ -493,8 +1010,12 @@ fn print_json(
         })
         .collect();
 
+    let entity_display = match &query.signature {
+        Some(sig) => format!("{}{}", query.name, sig),
+        None => query.name.clone(),
+    };
     let output = serde_json::json!({
-        "entity": entity_name,
+        "entity": entity_display,
         "file": file_path,
         "type": entity_type,
         "changes": json_entries,
@@ -505,53 +1026,6 @@ fn print_json(
 
 /// Search for an entity in other files changed by a commit.
 /// First tries matching by name, then falls back to structural_hash (handles renames).
-fn search_entity_cross_file(
-    bridge: &GitBridge,
-    registry: &ParserRegistry,
-    sha: &str,
-    entity_name: &str,
-    prev_structural_hash: Option<&str>,
-    exclude_file: &str,
-) -> Option<(String, SemanticEntity)> {
-    let changed_files = bridge.get_commit_changed_files(sha).ok()?;
-
-    // First pass: match by name
-    for file_path in &changed_files {
-        if file_path == exclude_file {
-            continue;
-        }
-        let content = match bridge.read_file_at_ref(sha, file_path) {
-            Ok(Some(c)) => c,
-            _ => continue,
-        };
-        let entities = registry.extract_entities(file_path, &content);
-        if let Some(ent) = entities.into_iter().find(|e| e.name == entity_name) {
-            return Some((file_path.clone(), ent));
-        }
-    }
-
-    // Second pass: match by structural_hash (handles renames)
-    let prev_hash = prev_structural_hash?;
-    for file_path in &changed_files {
-        if file_path == exclude_file {
-            continue;
-        }
-        let content = match bridge.read_file_at_ref(sha, file_path) {
-            Ok(Some(c)) => c,
-            _ => continue,
-        };
-        let entities = registry.extract_entities(file_path, &content);
-        if let Some(ent) = entities
-            .into_iter()
-            .find(|e| e.structural_hash.as_deref() == Some(prev_hash))
-        {
-            return Some((file_path.clone(), ent));
-        }
-    }
-
-    None
-}
-
 enum FindResult {
     Found(String),
     Ambiguous(Vec<String>),
@@ -561,12 +1035,13 @@ enum FindResult {
 fn find_entity_file(
     root: &Path,
     registry: &sem_core::parser::registry::ParserRegistry,
-    entity_name: &str,
+    query: &EntityQuery,
 ) -> FindResult {
     let ext_filter: Vec<String> = vec![];
     let files = super::graph::find_supported_files_public(root, registry, &ext_filter);
     let mut found_in: Vec<String> = Vec::new();
 
+    // Pass 1: Try exact (name, signature) match
     for file_path in &files {
         let full_path = root.join(file_path);
         let content = match std::fs::read_to_string(&full_path) {
@@ -575,8 +1050,31 @@ fn find_entity_file(
         };
 
         let entities = registry.extract_entities(file_path, &content);
-        if entities.iter().any(|e| e.name == entity_name) {
+        let matches: Vec<_> = if let Some(sig) = &query.signature {
+            entities.iter().filter(|e| e.name == query.name && e.signature.as_deref() == Some(sig.as_str())).collect()
+        } else {
+            entities.iter().filter(|e| e.name == query.name).collect()
+        };
+        if !matches.is_empty() {
             found_in.push(file_path.clone());
+        }
+    }
+
+    // Pass 2: If not found and signature was specified, fall back to name-only search.
+    // The signature may have changed — find the file by name, then let the log
+    // tracking algorithm detect the signature change via content matching.
+    if found_in.is_empty() && query.signature.is_some() {
+        for file_path in &files {
+            let full_path = root.join(file_path);
+            let content = match std::fs::read_to_string(&full_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let entities = registry.extract_entities(file_path, &content);
+            if entities.iter().any(|e| e.name == query.name) {
+                found_in.push(file_path.clone());
+            }
         }
     }
 
@@ -623,4 +1121,265 @@ fn chrono_lite_format(unix_seconds: i64) -> String {
 
 fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_entity(name: &str, signature: Option<&str>, content_hash: &str, structural_hash: Option<&str>) -> SemanticEntity {
+        SemanticEntity {
+            id: format!("file.cs::method::{name}{}", signature.unwrap_or("")),
+            file_path: "file.cs".to_string(),
+            entity_type: "method".to_string(),
+            name: name.to_string(),
+            signature: signature.map(|s| s.to_string()),
+            parent_id: None,
+            content: String::new(),
+            content_hash: content_hash.to_string(),
+            structural_hash: structural_hash.map(|s| s.to_string()),
+            start_line: 1,
+            end_line: 10,
+            metadata: None,
+        }
+    }
+
+    // --- parse_entity_query tests ---
+
+    #[test]
+    fn test_parse_entity_query_name_only() {
+        let q = parse_entity_query("Process");
+        assert_eq!(q.name, "Process");
+        assert!(q.signature.is_none());
+    }
+
+    #[test]
+    fn test_parse_entity_query_with_signature() {
+        let q = parse_entity_query("Process(int,string)");
+        assert_eq!(q.name, "Process");
+        assert_eq!(q.signature.as_deref(), Some("(int,string)"));
+    }
+
+    #[test]
+    fn test_parse_entity_query_empty_params() {
+        let q = parse_entity_query("Process()");
+        assert_eq!(q.name, "Process");
+        assert_eq!(q.signature.as_deref(), Some("()"));
+    }
+
+    #[test]
+    fn test_parse_entity_query_complex_types() {
+        let q = parse_entity_query("Handle(std::vector<int>,string)");
+        assert_eq!(q.name, "Handle");
+        assert_eq!(q.signature.as_deref(), Some("(std::vector<int>,string)"));
+    }
+
+    #[test]
+    fn test_parse_entity_query_nested_parens() {
+        // Name containing parentheses — should use rfind
+        let q = parse_entity_query("operator()(int)");
+        assert_eq!(q.name, "operator()");
+        assert_eq!(q.signature.as_deref(), Some("(int)"));
+    }
+
+    // --- find_entity_in_commit tests ---
+
+    #[test]
+    fn test_find_entity_exact_overload() {
+        let entities = vec![
+            make_entity("Process", Some("(int)"), "hash_a", None),
+            make_entity("Process", Some("(string)"), "hash_b", None),
+        ];
+        let result = find_entity_in_commit(
+            &entities, "Process", Some("(int)"),
+            "Process", Some("(int)"),
+            None, None, None,
+        );
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.entity.content_hash, "hash_a");
+        assert!(m.match_type.is_none());
+    }
+
+    #[test]
+    fn test_find_entity_no_signature_single() {
+        let entities = vec![
+            make_entity("Process", None, "hash_a", None),
+        ];
+        let result = find_entity_in_commit(
+            &entities, "Process", None,
+            "Process", None,
+            None, None, None,
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().entity.content_hash, "hash_a");
+    }
+
+    #[test]
+    fn test_find_entity_no_signature_picks_by_content() {
+        let entities = vec![
+            make_entity("Process", Some("(int)"), "hash_a", None),
+            make_entity("Process", Some("(string)"), "hash_b", None),
+        ];
+        // prev was hash_b, so should pick (string) overload
+        let result = find_entity_in_commit(
+            &entities, "Process", None,
+            "Process", None,
+            Some("hash_b"), None, None,
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().entity.content_hash, "hash_b");
+    }
+
+    #[test]
+    fn test_find_entity_no_signature_picks_by_structural_hash() {
+        let entities = vec![
+            make_entity("Process", Some("(int)"), "hash_a", Some("struct_a")),
+            make_entity("Process", Some("(string)"), "hash_b", Some("struct_b")),
+        ];
+        let result = find_entity_in_commit(
+            &entities, "Process", None,
+            "Process", None,
+            None, Some("struct_b"), None,
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().entity.content_hash, "hash_b");
+    }
+
+    #[test]
+    fn test_find_entity_signature_changed_by_content() {
+        let entities = vec![
+            make_entity("Process", Some("(string)"), "hash_a", None),
+        ];
+        // Previous was Process(int) with content_hash=hash_a
+        let result = find_entity_in_commit(
+            &entities, "Process", Some("(int)"),
+            "Process", Some("(int)"),
+            Some("hash_a"), None, None,
+        );
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.entity.signature.as_deref(), Some("(string)"));
+        assert!(matches!(m.match_type, Some(EntityChangeType::SignatureChanged)));
+        assert_eq!(m.old_signature.as_deref(), Some("(int)"));
+    }
+
+    #[test]
+    fn test_find_entity_signature_changed_by_structural_hash() {
+        let entities = vec![
+            make_entity("Process", Some("(string)"), "hash_x", Some("struct_a")),
+        ];
+        let result = find_entity_in_commit(
+            &entities, "Process", Some("(int)"),
+            "Process", Some("(int)"),
+            None, Some("struct_a"), None,
+        );
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.entity.signature.as_deref(), Some("(string)"));
+        assert!(matches!(m.match_type, Some(EntityChangeType::SignatureChanged)));
+    }
+
+    #[test]
+    fn test_find_entity_signature_changed_by_jaccard() {
+        // Signature changed: bool → float in a parameter
+        // content_hash and structural_hash both differ, but content is very similar
+        let prev_content = "public int GetDownPackageCount(bool isSilent, bool hasWait, bool isHasPause)\n{\n    return 1;\n}";
+        let new_content =  "public int GetDownPackageCount(bool isSilent, bool hasWait, float isHasPause)\n{\n    return 1;\n}";
+        let entities = vec![
+            SemanticEntity {
+                id: "file.cs::method::GetDownPackageCount(bool,bool,float)".to_string(),
+                file_path: "file.cs".to_string(),
+                entity_type: "method".to_string(),
+                name: "GetDownPackageCount".to_string(),
+                signature: Some("(bool,bool,float)".to_string()),
+                parent_id: None,
+                content: new_content.to_string(),
+                content_hash: "hash_float".to_string(),
+                structural_hash: Some("struct_float".to_string()),
+                start_line: 1,
+                end_line: 10,
+                metadata: None,
+            },
+            make_entity("GetDownPackageCount", Some("(bool,bool)"), "hash_short", None),
+        ];
+        let result = find_entity_in_commit(
+            &entities, "GetDownPackageCount", Some("(bool,bool,bool)"),
+            "GetDownPackageCount", Some("(bool,bool,bool)"),
+            Some("hash_bool"), Some("struct_bool"),
+            Some(prev_content),
+        );
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.entity.signature.as_deref(), Some("(bool,bool,float)"));
+        assert!(matches!(m.match_type, Some(EntityChangeType::SignatureChanged)));
+        assert_eq!(m.old_signature.as_deref(), Some("(bool,bool,bool)"));
+    }
+
+    #[test]
+    fn test_find_entity_renamed_by_content_hash() {
+        let entities = vec![
+            make_entity("Handle", Some("(int)"), "hash_a", None),
+        ];
+        // Previous was Process(int) with content_hash=hash_a
+        let result = find_entity_in_commit(
+            &entities, "Process", Some("(int)"),
+            "Process", Some("(int)"),
+            Some("hash_a"), None, None,
+        );
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.entity.name, "Handle");
+        assert!(matches!(m.match_type, Some(EntityChangeType::Renamed)));
+        assert_eq!(m.old_name.as_deref(), Some("Process"));
+    }
+
+    #[test]
+    fn test_find_entity_renamed_by_structural_hash() {
+        let entities = vec![
+            make_entity("Handle", Some("(int)"), "hash_x", Some("struct_a")),
+        ];
+        let result = find_entity_in_commit(
+            &entities, "Process", Some("(int)"),
+            "Process", Some("(int)"),
+            None, Some("struct_a"), None,
+        );
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.entity.name, "Handle");
+        assert!(matches!(m.match_type, Some(EntityChangeType::Renamed)));
+    }
+
+    #[test]
+    fn test_find_entity_not_found() {
+        let entities = vec![
+            make_entity("Other", None, "hash_a", None),
+        ];
+        let result = find_entity_in_commit(
+            &entities, "Process", Some("(int)"),
+            "Process", Some("(int)"),
+            Some("hash_z"), None, None,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_entity_signature_change_preferred_over_rename() {
+        // Process(string) [sig change] matches by structural_hash, Handle(int) [rename] doesn't
+        // Signature change should be preferred (Phase B before Phase C)
+        let entities = vec![
+            make_entity("Process", Some("(string)"), "hash_x", Some("struct_a")),
+            make_entity("Handle", Some("(int)"), "hash_y", None),
+        ];
+        let result = find_entity_in_commit(
+            &entities, "Process", Some("(int)"),
+            "Process", Some("(int)"),
+            None, Some("struct_a"), None,
+        );
+        assert!(result.is_some());
+        let m = result.unwrap();
+        // Should match Process(string) as SignatureChanged via structural_hash
+        assert_eq!(m.entity.name, "Process");
+        assert!(matches!(m.match_type, Some(EntityChangeType::SignatureChanged)));
+    }
 }

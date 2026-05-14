@@ -511,7 +511,7 @@ fn run_diff_pipeline(
         eprintln!("\x1b[2m  total                {total_ms:>8.2}ms\x1b[0m");
         eprintln!("\x1b[2m  files: {}  entities: {}  changes: {}\x1b[0m",
             file_changes.len(), result.changes.len(),
-            result.added_count + result.modified_count + result.deleted_count + result.moved_count + result.renamed_count + result.reordered_count);
+            result.added_count + result.modified_count + result.deleted_count + result.moved_count + result.renamed_count + result.reordered_count + result.signature_changed_count);
         eprintln!("\x1b[2m─────────────────────────────────────────────\x1b[0m");
     }
 }

@@ -28,6 +28,7 @@ pub fn format_plain(result: &DiffResult) -> String {
                 ChangeType::Renamed => "R".cyan().to_string(),
                 ChangeType::Moved => ">".blue().to_string(),
                 ChangeType::Reordered => "O".magenta().to_string(),
+                ChangeType::SignatureChanged => "S".yellow().to_string(),
             };
 
             let type_label = format!("{:<12}", change.entity_type);

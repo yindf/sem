@@ -39,6 +39,7 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                 ChangeType::Moved => "→",
                 ChangeType::Renamed => "↻",
                 ChangeType::Reordered => "↕",
+                ChangeType::SignatureChanged => "⌁",
             };
 
             let name_display = if let Some(ref old_name) = change.old_entity_name {
@@ -76,7 +77,7 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                             post_table.push("```".to_string());
                         }
                     }
-                    ChangeType::Modified | ChangeType::Moved => {
+                    ChangeType::Modified | ChangeType::Moved | ChangeType::SignatureChanged => {
                         if let (Some(before), Some(after)) =
                             (&change.before_content, &change.after_content)
                         {
@@ -117,7 +118,7 @@ pub fn format_markdown(result: &DiffResult, verbose: bool) -> String {
                     }
                     _ => {}
                 }
-            } else if change.change_type == ChangeType::Modified {
+            } else if matches!(change.change_type, ChangeType::Modified | ChangeType::SignatureChanged) {
                 if let (Some(before), Some(after)) =
                     (&change.before_content, &change.after_content)
                 {

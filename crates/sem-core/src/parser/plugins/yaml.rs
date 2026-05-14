@@ -25,10 +25,11 @@ impl SemanticParserPlugin for YamlParserPlugin {
             // changes to comment-only or marker-only YAML files are detected.
             if !content.trim().is_empty() {
                 return vec![SemanticEntity {
-                    id: build_entity_id(file_path, "chunk", "(document)", None),
+                    id: build_entity_id(file_path, "chunk", "(document)", None, None),
                     file_path: file_path.to_string(),
                     entity_type: "chunk".to_string(),
                     name: "(document)".to_string(),
+                    signature: None,
                     parent_id: None,
                     content_hash: content_hash(content),
                     structural_hash: None,
@@ -63,10 +64,11 @@ impl SemanticParserPlugin for YamlParserPlugin {
                 let preamble_content = lines[..preamble_end].join("\n");
                 if !preamble_content.trim().is_empty() {
                     entities.push(SemanticEntity {
-                        id: build_entity_id(file_path, "chunk", "(preamble)", None),
+                        id: build_entity_id(file_path, "chunk", "(preamble)", None, None),
                         file_path: file_path.to_string(),
                         entity_type: "chunk".to_string(),
                         name: "(preamble)".to_string(),
+                        signature: None,
                         parent_id: None,
                         content_hash: content_hash(&preamble_content),
                         structural_hash: None,
@@ -93,10 +95,11 @@ impl SemanticParserPlugin for YamlParserPlugin {
 
             // Hash raw text so comment changes within a section are detected.
             entities.push(SemanticEntity {
-                id: build_entity_id(file_path, entity_type, &tk.key, None),
+                id: build_entity_id(file_path, entity_type, &tk.key, None, None),
                 file_path: file_path.to_string(),
                 entity_type: entity_type.to_string(),
                 name: tk.key.clone(),
+                signature: None,
                 parent_id: None,
                 content_hash: content_hash(&entity_content),
                 structural_hash: None,

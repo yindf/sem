@@ -180,6 +180,7 @@ impl DiskCache {
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
                     metadata,
+                    signature: None,
                 })
             })
             .ok()?
@@ -325,6 +326,7 @@ impl DiskCache {
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
                     metadata,
+                    signature: None,
                 })
             })
             .ok()?

@@ -19,6 +19,7 @@ pub struct DiffResult {
     pub moved_count: usize,
     pub renamed_count: usize,
     pub reordered_count: usize,
+    pub signature_changed_count: usize,
     pub orphan_count: usize,
 }
 
@@ -115,6 +116,7 @@ pub fn compute_semantic_diff(
     let mut moved_count = 0;
     let mut renamed_count = 0;
     let mut reordered_count = 0;
+    let mut signature_changed_count = 0;
     let mut orphan_count = 0;
 
     for c in &all_changes {
@@ -129,6 +131,7 @@ pub fn compute_semantic_diff(
             ChangeType::Moved => moved_count += 1,
             ChangeType::Renamed => renamed_count += 1,
             ChangeType::Reordered => reordered_count += 1,
+            ChangeType::SignatureChanged => signature_changed_count += 1,
         }
     }
 
@@ -141,6 +144,7 @@ pub fn compute_semantic_diff(
         moved_count,
         renamed_count,
         reordered_count,
+        signature_changed_count,
         orphan_count,
     }
 }
@@ -183,7 +187,7 @@ fn suppress_redundant_parents(
 
     let mut suppress: HashSet<String> = HashSet::new();
     for change in changes.iter() {
-        if !matches!(change.change_type, ChangeType::Modified | ChangeType::Added | ChangeType::Deleted) {
+        if !matches!(change.change_type, ChangeType::Modified | ChangeType::Added | ChangeType::Deleted | ChangeType::SignatureChanged) {
             continue;
         }
         if !CONTAINER_TYPES.contains(&change.entity_type.as_str()) {
@@ -200,9 +204,9 @@ fn suppress_redundant_parents(
         }
 
         // Added/Deleted: suppress unconditionally; the children carry the detail.
-        // Modified: only suppress if the container's own declaration is unchanged
+        // Modified/SignatureChanged: only suppress if the container's own declaration is unchanged
         // and the value type didn't transition.
-        let should_suppress = if change.change_type == ChangeType::Modified {
+        let should_suppress = if matches!(change.change_type, ChangeType::Modified | ChangeType::SignatureChanged) {
             match (before_by_id.get(eid), after_by_id.get(eid)) {
                 (Some(bp), Some(ap)) if bp.entity_type == ap.entity_type => {
                     let before_own = strip_children_content(&bp.content, bp.start_line, b_children);
@@ -347,6 +351,7 @@ fn detect_orphan_changes(
         parent_name: None,
         file_path: file.file_path.clone(),
         old_entity_name: None,
+        old_signature: None,
         old_file_path: None,
         old_parent_id: None,
         before_content: if before_orphan.is_empty() {

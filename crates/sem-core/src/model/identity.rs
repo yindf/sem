@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::change::{ChangeType, SemanticChange};
-use super::entity::SemanticEntity;
+use super::entity::{SemanticEntity, logical_key, build_entity_id};
 
 fn parent_name(
     entity: &SemanticEntity,
@@ -84,6 +84,9 @@ fn make_change(
         old_entity_name: before_entity.and_then(|b| {
             (b.name != after_entity.name).then(|| b.name.clone())
         }),
+        old_signature: before_entity.and_then(|b| {
+            (b.signature != after_entity.signature).then(|| b.signature.clone()).flatten()
+        }),
         old_file_path: before_entity.and_then(|b| {
             (b.file_path != after_entity.file_path).then(|| b.file_path.clone())
         }),
@@ -103,8 +106,9 @@ fn make_change(
     }
 }
 
-/// 3-phase entity matching algorithm:
+/// 4-phase entity matching algorithm:
 /// 1. Exact ID match — same entity ID in before/after → modified or unchanged
+/// 1.5. Logical key match — same (file, parent, name) but different signature → signature changed
 /// 2. Content hash match — same hash, different ID → renamed or moved
 /// 3. Fuzzy similarity — >80% content similarity → probable rename
 pub fn match_entities(
@@ -150,6 +154,181 @@ pub fn match_entities(
     }
 
     // Collect unmatched
+    let unmatched_before: Vec<&SemanticEntity> = before
+        .iter()
+        .filter(|e| !matched_before.contains(e.id.as_str()))
+        .collect();
+    let unmatched_after: Vec<&SemanticEntity> = after
+        .iter()
+        .filter(|e| !matched_after.contains(e.id.as_str()))
+        .collect();
+
+    // Phase 1.5: Overload signature matching with content-based optimal pairing.
+    //
+    // Groups ALL entities (both Phase 1 matched and unmatched) by logical key
+    // and finds the optimal pairing using content similarity. This allows
+    // breaking a Phase 1 "Modified" match when a cross-signature pairing
+    // produces a better content match.
+    //
+    // Example where Phase 1 is suboptimal:
+    //   Before: Process(bool,bool){simple}, Process(bool,bool,bool){complex}
+    //   After:  Process(bool,bool){complex}, Process(bool,bool,float){simple}
+    //   Phase 1 matches (bool,bool)→(bool,bool) as Modified.
+    //   Phase 1.5 reassigns: (bool,bool,bool){complex}→(bool,bool){complex}=SignatureChanged
+    //                        (bool,bool){simple}→(bool,bool,float){simple}=SignatureChanged
+    {
+        // Step 1: Check if any Phase 1 "Modified" match should be broken
+        //         because an unmatched entity is a better content fit.
+        let mut changes_to_remove: Vec<usize> = Vec::new();
+        let mut new_changes: Vec<SemanticChange> = Vec::new();
+
+        for (change_idx, change) in changes.iter().enumerate() {
+            if change.change_type != ChangeType::Modified {
+                continue;
+            }
+            if change.entity_id.is_empty() {
+                continue;
+            }
+
+            // Look up the after entity for this Modified change
+            let after_entity = match after_by_id.get(change.entity_id.as_str()) {
+                Some(e) => *e,
+                None => continue,
+            };
+            // Only consider entities that have signatures (overload candidates)
+            if after_entity.signature.is_none() {
+                continue;
+            }
+
+            let after_key = logical_key(after_entity);
+
+            // Current Phase 1 match score
+            let before_entity = match before_by_id.get(change.entity_id.as_str()) {
+                Some(e) => *e,
+                None => continue,
+            };
+            let current_score = overload_similarity(before_entity, after_entity);
+
+            // Find the best unmatched before entity for this after entity
+            let mut best_unmatched: Option<(&SemanticEntity, f64)> = None;
+            for entity in &unmatched_before {
+                if entity.signature.is_none() {
+                    continue;
+                }
+                if logical_key(entity) != after_key {
+                    continue;
+                }
+                if entity.signature == after_entity.signature {
+                    continue; // Same signature → not a signature change
+                }
+                let score = overload_similarity(entity, after_entity);
+                if score > current_score {
+                    match best_unmatched {
+                        Some((_, best)) if score <= best => {}
+                        _ => best_unmatched = Some((entity, score)),
+                    }
+                }
+            }
+
+            if let Some((better_before, better_score)) = best_unmatched {
+                // Break the Phase 1 match: better_before → after_entity is SignatureChanged
+                // The old before_entity becomes unmatched (will be handled later)
+                matched_before.remove(before_entity.id.as_str());
+                matched_before.insert(&better_before.id);
+
+                changes_to_remove.push(change_idx);
+
+                let mut sig_change = make_change(
+                    after_entity,
+                    ChangeType::SignatureChanged,
+                    Some(better_before),
+                    commit_sha,
+                    author,
+                    &combined_by_id,
+                );
+                sig_change.structural_change = match (&better_before.structural_hash, &after_entity.structural_hash) {
+                    (Some(bsh), Some(ash)) => Some(bsh != ash),
+                    _ => Some(true),
+                };
+                new_changes.push(sig_change);
+            }
+        }
+
+        // Remove broken Phase 1 changes (iterate in reverse to preserve indices)
+        for idx in changes_to_remove.into_iter().rev() {
+            changes.remove(idx);
+        }
+        changes.extend(new_changes);
+
+        // Step 2: Match remaining unmatched entities by logical key + content similarity
+        // Re-collect unmatched after Step 1 may have changed matched sets
+        let unmatched_before: Vec<&SemanticEntity> = before
+            .iter()
+            .filter(|e| !matched_before.contains(e.id.as_str()))
+            .collect();
+        let unmatched_after: Vec<&SemanticEntity> = after
+            .iter()
+            .filter(|e| !matched_after.contains(e.id.as_str()))
+            .collect();
+
+        // Group remaining unmatched entities by logical key
+        let mut before_by_logical: HashMap<String, Vec<&SemanticEntity>> = HashMap::new();
+        for entity in &unmatched_before {
+            if entity.signature.is_some() {
+                before_by_logical
+                    .entry(logical_key(entity))
+                    .or_default()
+                    .push(entity);
+            }
+        }
+
+        for after_entity in &unmatched_after {
+            if matched_after.contains(after_entity.id.as_str()) {
+                continue;
+            }
+            if after_entity.signature.is_none() {
+                continue;
+            }
+            let key = logical_key(after_entity);
+            let candidates = match before_by_logical.get_mut(&key) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // Find the best content match among unmatched before entities
+            let mut best_idx: Option<usize> = None;
+            let mut best_score: f64 = 0.0;
+            for (i, before_entity) in candidates.iter().enumerate() {
+                if matched_before.contains(before_entity.id.as_str()) {
+                    continue;
+                }
+                let score = overload_similarity(before_entity, after_entity);
+                if score > best_score {
+                    best_score = score;
+                    best_idx = Some(i);
+                }
+            }
+
+            if let Some(idx) = best_idx {
+                let before_entity = candidates.remove(idx);
+                matched_before.insert(&before_entity.id);
+                matched_after.insert(&after_entity.id);
+
+                let mut change = make_change(
+                    after_entity,
+                    ChangeType::SignatureChanged,
+                    Some(before_entity),
+                    commit_sha,
+                    author,
+                    &combined_by_id,
+                );
+                change.structural_change = Some(best_score < 0.9);
+                changes.push(change);
+            }
+        }
+    }
+
+    // Re-collect unmatched after Phase 1.5
     let unmatched_before: Vec<&SemanticEntity> = before
         .iter()
         .filter(|e| !matched_before.contains(e.id.as_str()))
@@ -330,6 +509,26 @@ pub fn match_entities(
     MatchResult { changes }
 }
 
+/// Compute similarity score between two overload variants for optimal pairing.
+/// Uses a tiered scoring system:
+///   1.0  — content_hash exact match (body identical, only signature changed)
+///   0.9  — structural_hash match (body structurally identical, cosmetic diff)
+///   0.0-0.8 — Jaccard token similarity on content
+fn overload_similarity(a: &SemanticEntity, b: &SemanticEntity) -> f64 {
+    // Tier 1: exact content hash match
+    if a.content_hash == b.content_hash {
+        return 1.0;
+    }
+    // Tier 2: structural hash match (excludes name + cosmetic changes)
+    if let (Some(ref sha), Some(ref shb)) = (&a.structural_hash, &b.structural_hash) {
+        if sha == shb {
+            return 0.9;
+        }
+    }
+    // Tier 3: Jaccard token similarity
+    default_similarity(a, b)
+}
+
 /// Default content similarity using Jaccard index on whitespace-split tokens
 pub fn default_similarity(a: &SemanticEntity, b: &SemanticEntity) -> f64 {
     let tokens_a: Vec<&str> = a.content.split_whitespace().collect();
@@ -476,6 +675,7 @@ mod tests {
             file_path: file_path.to_string(),
             entity_type: "function".to_string(),
             name: name.to_string(),
+            signature: None,
             parent_id: None,
             content: content.to_string(),
             content_hash: content_hash(content),
@@ -532,6 +732,7 @@ mod tests {
             file_path: "a.ts".to_string(),
             entity_type: "class".to_string(),
             name: "DataStack".to_string(),
+            signature: None,
             parent_id: None,
             content: "class DataStack { constructor() {} genPg() { old } }".to_string(),
             content_hash: content_hash("class DataStack { constructor() {} genPg() { old } }"),
@@ -545,6 +746,7 @@ mod tests {
             file_path: "a.ts".to_string(),
             entity_type: "method".to_string(),
             name: "genPg".to_string(),
+            signature: None,
             parent_id: Some("a.ts::class::DataStack".to_string()),
             content: "genPg() { old }".to_string(),
             content_hash: content_hash("genPg() { old }"),
@@ -559,6 +761,7 @@ mod tests {
             file_path: "a.ts".to_string(),
             entity_type: "class".to_string(),
             name: "DataStack".to_string(),
+            signature: None,
             parent_id: None,
             content: "class DataStack { constructor() {} genPg() { new } }".to_string(),
             content_hash: content_hash("class DataStack { constructor() {} genPg() { new } }"),
@@ -572,6 +775,7 @@ mod tests {
             file_path: "a.ts".to_string(),
             entity_type: "method".to_string(),
             name: "genPg".to_string(),
+            signature: None,
             parent_id: Some("a.ts::class::DataStack".to_string()),
             content: "genPg() { new }".to_string(),
             content_hash: content_hash("genPg() { new }"),
@@ -600,6 +804,7 @@ mod tests {
             file_path: "a.ts".to_string(),
             entity_type: "class".to_string(),
             name: "Foo".to_string(),
+            signature: None,
             parent_id: None,
             content: "class Foo { bar() {} }".to_string(),
             content_hash: content_hash("class Foo { bar() {} }"),
@@ -613,6 +818,7 @@ mod tests {
             file_path: "a.ts".to_string(),
             entity_type: "method".to_string(),
             name: "bar".to_string(),
+            signature: None,
             parent_id: Some("a.ts::class::Foo".to_string()),
             content: "bar() {}".to_string(),
             content_hash: content_hash("bar() {}"),
@@ -627,6 +833,7 @@ mod tests {
             file_path: "a.ts".to_string(),
             entity_type: "class".to_string(),
             name: "Foo".to_string(),
+            signature: None,
             parent_id: None,
             content: "class Foo { x = 1; bar() {} }".to_string(),
             content_hash: content_hash("class Foo { x = 1; bar() {} }"),
@@ -640,6 +847,7 @@ mod tests {
             file_path: "a.ts".to_string(),
             entity_type: "method".to_string(),
             name: "bar".to_string(),
+            signature: None,
             parent_id: Some("a.ts::class::Foo".to_string()),
             content: "bar() {}".to_string(),
             content_hash: content_hash("bar() {}"),
@@ -665,6 +873,7 @@ mod tests {
             file_path: file_path.to_string(),
             entity_type: "method".to_string(),
             name: name.to_string(),
+            signature: None,
             parent_id: parent_id.map(String::from),
             content: content.to_string(),
             content_hash: content_hash(content),
@@ -717,6 +926,7 @@ mod tests {
             file_path: file_path.to_string(),
             entity_type: "function".to_string(),
             name: name.to_string(),
+            signature: None,
             parent_id: None,
             content: content.to_string(),
             content_hash: content_hash(content),
@@ -786,5 +996,380 @@ mod tests {
         // depends on which side of the cycle is reached first; the safety
         // property is "this returns at all."
         assert!(chain.is_some());
+    }
+
+    // Helper: create an entity with a signature for overload tests
+    fn make_sig_entity(
+        name: &str,
+        signature: Option<&str>,
+        content: &str,
+        file_path: &str,
+        parent_id: Option<&str>,
+    ) -> SemanticEntity {
+        let entity_type = if parent_id.is_some() { "method" } else { "function" };
+        let id = build_entity_id(file_path, entity_type, name, signature, parent_id);
+        SemanticEntity {
+            id,
+            file_path: file_path.to_string(),
+            entity_type: entity_type.to_string(),
+            name: name.to_string(),
+            signature: signature.map(String::from),
+            parent_id: parent_id.map(String::from),
+            content: content.to_string(),
+            content_hash: content_hash(content),
+            structural_hash: None,
+            start_line: 1,
+            end_line: 1,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_overloaded_methods_have_different_ids() {
+        // Two overloads of Process should have different entity IDs
+        let e1 = make_sig_entity("Process", Some("(int)"), "void Process(int x)", "a.cs", Some("Calc"));
+        let e2 = make_sig_entity("Process", Some("(string)"), "void Process(string s)", "a.cs", Some("Calc"));
+        assert_ne!(e1.id, e2.id, "Overloaded methods must have distinct IDs");
+    }
+
+    #[test]
+    fn test_overloaded_methods_both_tracked_as_separate() {
+        // Before: two overloads Process(int) and Process(string)
+        // After: Process(int) modified, Process(string) unchanged
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { return 1; }", "a.cs", Some("Calc")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { return 2; }", "a.cs", Some("Calc")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { return 3; }", "a.cs", Some("Calc")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { return 2; }", "a.cs", Some("Calc")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        // Only Process(int) was modified; Process(string) unchanged
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+        // The modified entity should contain "(int)" in its ID
+        assert!(result.changes[0].entity_id.contains("(int)"));
+    }
+
+    #[test]
+    fn test_overloaded_method_replaced_with_different_sig() {
+        // Before: Process(int) only
+        // After: Process(string) only (old overload removed, new one added)
+        // Phase 1.5 detects this as a signature change (same logical method name)
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x)", "a.cs", Some("Calc")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(string)"), "void Process(string s)", "a.cs", Some("Calc")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        // Phase 1.5 matches by logical key (same name, same parent) → SignatureChanged
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::SignatureChanged);
+        assert_eq!(result.changes[0].old_signature.as_deref(), Some("(int)"));
+    }
+
+    #[test]
+    fn test_different_name_methods_deleted_and_added() {
+        // When method names are truly different (not just signature change),
+        // we should get proper delete + add
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x)", "a.cs", Some("Calc")),
+        ];
+        let after = vec![
+            make_sig_entity("Handle", Some("(int)"), "void Handle(int x)", "a.cs", Some("Calc")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        // Different names, different content → deleted + added
+        assert_eq!(result.changes.len(), 2);
+        let types: Vec<ChangeType> = result.changes.iter().map(|c| c.change_type).collect();
+        assert!(types.contains(&ChangeType::Deleted));
+        assert!(types.contains(&ChangeType::Added));
+    }
+
+    #[test]
+    fn test_signature_change_detected() {
+        // Process(int) → Process(string): same method name, different parameter signature
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { doWork(); }", "a.cs", Some("Calc")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { doWork(); }", "a.cs", Some("Calc")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::SignatureChanged);
+        assert_eq!(result.changes[0].old_signature.as_deref(), Some("(int)"));
+    }
+
+    #[test]
+    fn test_signature_change_with_body_change() {
+        // Process(int) → Process(string) with body also changed
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { old(); }", "a.cs", Some("Calc")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { new(); }", "a.cs", Some("Calc")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::SignatureChanged);
+        assert_eq!(result.changes[0].old_signature.as_deref(), Some("(int)"));
+    }
+
+    #[test]
+    fn test_overload_one_modified_one_signature_changed() {
+        // Two overloads: one modified (body change), one signature change
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { old(); }", "a.cs", Some("Calc")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { same(); }", "a.cs", Some("Calc")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { new(); }", "a.cs", Some("Calc")),
+            make_sig_entity("Process", Some("(bool)"), "void Process(bool b) { same(); }", "a.cs", Some("Calc")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        // Process(int) → Modified (body changed, signature same)
+        // Process(string) → SignatureChanged (→ Process(bool), body same structure)
+        assert_eq!(result.changes.len(), 2);
+        let types: Vec<ChangeType> = result.changes.iter().map(|c| c.change_type).collect();
+        assert!(types.contains(&ChangeType::Modified));
+        assert!(types.contains(&ChangeType::SignatureChanged));
+    }
+
+    #[test]
+    fn test_no_signature_entities_unaffected() {
+        // Entities without signatures should still work as before
+        let before = vec![make_entity("a::f::foo", "foo", "old content", "a.ts")];
+        let after = vec![make_entity("a::f::foo", "foo", "new content", "a.ts")];
+        let result = match_entities(&before, &after, "a.ts", None, None, None);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+    }
+
+    #[test]
+    fn test_overload_three_variants() {
+        // Three overloads: one unchanged, one modified, one added
+        let before = vec![
+            make_sig_entity("Do", Some("(int)"), "void Do(int x) { a(); }", "a.cs", Some("C")),
+            make_sig_entity("Do", Some("(string)"), "void Do(string s) { b(); }", "a.cs", Some("C")),
+        ];
+        let after = vec![
+            make_sig_entity("Do", Some("(int)"), "void Do(int x) { a(); }", "a.cs", Some("C")),  // unchanged
+            make_sig_entity("Do", Some("(string)"), "void Do(string s) { b2(); }", "a.cs", Some("C")),  // modified
+            make_sig_entity("Do", Some("(bool)"), "void Do(bool b) { c(); }", "a.cs", Some("C")),  // added
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        assert_eq!(result.changes.len(), 2);
+        let types: Vec<ChangeType> = result.changes.iter().map(|c| c.change_type).collect();
+        assert!(types.contains(&ChangeType::Modified));
+        assert!(types.contains(&ChangeType::Added));
+        // Make sure the modified one is Do(string), not Do(int)
+        let modified = result.changes.iter().find(|c| c.change_type == ChangeType::Modified).unwrap();
+        assert!(modified.entity_id.contains("(string)"));
+    }
+
+    // ─── Overload count change scenarios ────────────────────────────────
+
+    #[test]
+    fn test_overload_count_increases_new_is_added() {
+        // Before: Process(int) — single overload
+        // After: Process(int), Process(string) — overload added
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { f(); }", "a.cs", Some("C")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { f(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { g(); }", "a.cs", Some("C")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        // Process(int) matched by Phase 1 (unchanged). Process(string) → Added.
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Added);
+        assert!(result.changes[0].entity_id.contains("(string)"));
+    }
+
+    #[test]
+    fn test_overload_count_decreases_old_is_deleted() {
+        // Before: Process(int), Process(string) — two overloads
+        // After: Process(int) — one overload deleted
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { f(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { g(); }", "a.cs", Some("C")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { f(); }", "a.cs", Some("C")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        // Process(int) matched by Phase 1 (unchanged). Process(string) → Deleted.
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::Deleted);
+        assert!(result.changes[0].entity_id.contains("(string)"));
+    }
+
+    #[test]
+    fn test_overload_same_count_signature_swap_with_content_matching() {
+        // Same overload count (2), both signatures changed.
+        // Content similarity determines the pairing:
+        //   Process(int){bodyA} → Process(double){bodyA}  (same body → SignatureChanged)
+        //   Process(string){bodyB} → Process(bool){bodyB}  (same body → SignatureChanged)
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { bodyA(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { bodyB(); }", "a.cs", Some("C")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(double)"), "void Process(double x) { bodyA(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(bool)"), "void Process(bool b) { bodyB(); }", "a.cs", Some("C")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        // Both should be SignatureChanged, paired by content similarity
+        assert_eq!(result.changes.len(), 2);
+        assert!(result.changes.iter().all(|c| c.change_type == ChangeType::SignatureChanged));
+
+        // Verify correct pairing: (int)→(double) and (string)→(bool)
+        let int_to_double = result.changes.iter().find(|c| c.old_signature.as_deref() == Some("(int)"));
+        let string_to_bool = result.changes.iter().find(|c| c.old_signature.as_deref() == Some("(string)"));
+        assert!(int_to_double.is_some(), "should find (int)→(double) pairing");
+        assert!(string_to_bool.is_some(), "should find (string)→(bool) pairing");
+
+        let int_change = int_to_double.unwrap();
+        assert!(int_change.entity_id.contains("(double)"), "(int) should pair with (double) via bodyA");
+    }
+
+    #[test]
+    fn test_overload_mixed_add_and_signature_change() {
+        // Before: Process(int){bodyA}, Process(string){bodyB}  (2 overloads)
+        // After: Process(bool){bodyA}, Process(string){bodyB}, Process(double){bodyC}  (3 overloads)
+        //
+        // Process(string) matches by Phase 1 (unchanged).
+        // Process(int){bodyA} → Process(bool){bodyA} : SignatureChanged (content matches)
+        // Process(double){bodyC} : Added (no match)
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { bodyA(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { bodyB(); }", "a.cs", Some("C")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(bool)"), "void Process(bool b) { bodyA(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { bodyB(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(double)"), "void Process(double x) { bodyC(); }", "a.cs", Some("C")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        assert_eq!(result.changes.len(), 2);
+        let types: Vec<ChangeType> = result.changes.iter().map(|c| c.change_type).collect();
+        assert!(types.contains(&ChangeType::SignatureChanged));
+        assert!(types.contains(&ChangeType::Added));
+
+        // Verify: (int)→(bool) by content, (double) is new
+        let sig_changed = result.changes.iter().find(|c| c.change_type == ChangeType::SignatureChanged).unwrap();
+        assert_eq!(sig_changed.old_signature.as_deref(), Some("(int)"));
+        assert!(sig_changed.entity_id.contains("(bool)"));
+    }
+
+    #[test]
+    fn test_overload_mixed_delete_and_signature_change() {
+        // Before: Process(int){bodyA}, Process(string){bodyB}, Process(double){bodyC}  (3)
+        // After: Process(bool){bodyA}, Process(string){bodyB}  (2)
+        //
+        // Process(string) matches by Phase 1 (unchanged).
+        // Process(int){bodyA} → Process(bool){bodyA} : SignatureChanged (content matches)
+        // Process(double){bodyC} : Deleted (no match)
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { bodyA(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { bodyB(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(double)"), "void Process(double x) { bodyC(); }", "a.cs", Some("C")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(bool)"), "void Process(bool b) { bodyA(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { bodyB(); }", "a.cs", Some("C")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        assert_eq!(result.changes.len(), 2);
+        let types: Vec<ChangeType> = result.changes.iter().map(|c| c.change_type).collect();
+        assert!(types.contains(&ChangeType::SignatureChanged));
+        assert!(types.contains(&ChangeType::Deleted));
+
+        // Verify: (int)→(bool) by content, (double) deleted
+        let sig_changed = result.changes.iter().find(|c| c.change_type == ChangeType::SignatureChanged).unwrap();
+        assert_eq!(sig_changed.old_signature.as_deref(), Some("(int)"));
+        let deleted = result.changes.iter().find(|c| c.change_type == ChangeType::Deleted).unwrap();
+        assert!(deleted.entity_id.contains("(double)"));
+    }
+
+    #[test]
+    fn test_single_overload_signature_change_is_always_signature_changed() {
+        // User's rule #1: if there's only one method with that name, signature change
+        // is always SignatureChanged (never delete+add)
+        let before = vec![
+            make_sig_entity("Handle", Some("(int)"), "void Handle(int x) { unique_body(); }", "a.cs", Some("C")),
+        ];
+        let after = vec![
+            make_sig_entity("Handle", Some("(string,int)"), "void Handle(string s, int n) { completely_different(); }", "a.cs", Some("C")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].change_type, ChangeType::SignatureChanged);
+        assert_eq!(result.changes[0].old_signature.as_deref(), Some("(int)"));
+    }
+
+    #[test]
+    fn test_phase1_break_when_signature_swap_with_bodies_swapped() {
+        // The critical scenario from user's feedback:
+        // Before: Process(bool,bool){simple body}, Process(bool,bool,bool){complex body}
+        // After:  Process(bool,bool){complex body}, Process(bool,bool,float){simple body}
+        //
+        // Phase 1 matches (bool,bool)→(bool,bool) as Modified.
+        // Phase 1.5 should break this: the complex body after-entity is actually
+        // a better match for the (bool,bool,bool) before-entity.
+        //
+        // Expected result: two SignatureChanged
+        let before = vec![
+            make_sig_entity("Process", Some("(bool,bool)"),
+                "void Process(bool a, bool b) { return simple(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(bool,bool,bool)"),
+                "void Process(bool a, bool b, bool c) { int g = computeGroupId(); return complex(g); }", "a.cs", Some("C")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(bool,bool)"),
+                "void Process(bool a, bool b) { int g = computeGroupId(); return complex(g); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(bool,bool,float)"),
+                "void Process(bool a, bool b, float x) { return simple(); }", "a.cs", Some("C")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+
+        // Should get 2 SignatureChanged, NOT Modified+Deleted+Added
+        assert_eq!(result.changes.len(), 2);
+        let types: Vec<ChangeType> = result.changes.iter().map(|c| c.change_type).collect();
+        assert!(types.iter().all(|t| *t == ChangeType::SignatureChanged),
+            "expected all SignatureChanged, got {:?}", types);
+
+        // Verify correct pairing by checking old_signature
+        let sig_changes: Vec<_> = result.changes.iter()
+            .filter(|c| c.change_type == ChangeType::SignatureChanged)
+            .collect();
+        let old_sigs: Vec<&str> = sig_changes.iter()
+            .filter_map(|c| c.old_signature.as_deref())
+            .collect();
+        assert!(old_sigs.contains(&"(bool,bool)"), "should have (bool,bool) as old sig");
+        assert!(old_sigs.contains(&"(bool,bool,bool)"), "should have (bool,bool,bool) as old sig");
+    }
+
+    #[test]
+    fn test_phase1_not_broken_when_content_match_is_worse() {
+        // Don't break Phase 1 match if the unmatched entity is NOT a better content match
+        // Before: Process(int){bodyA}, Process(string){bodyB}
+        // After:  Process(int){bodyA_modified}, Process(string){bodyB_modified}
+        let before = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { bodyA(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { bodyB(); }", "a.cs", Some("C")),
+        ];
+        let after = vec![
+            make_sig_entity("Process", Some("(int)"), "void Process(int x) { bodyA_changed(); }", "a.cs", Some("C")),
+            make_sig_entity("Process", Some("(string)"), "void Process(string s) { bodyB_changed(); }", "a.cs", Some("C")),
+        ];
+        let result = match_entities(&before, &after, "a.cs", None, None, None);
+        // Both should be Modified (Phase 1 matches, Phase 1.5 doesn't break them)
+        assert_eq!(result.changes.len(), 2);
+        assert!(result.changes.iter().all(|c| c.change_type == ChangeType::Modified));
     }
 }

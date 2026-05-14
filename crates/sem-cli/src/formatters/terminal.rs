@@ -101,6 +101,10 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                     "↕".magenta().to_string(),
                     "[reordered]".magenta().to_string(),
                 ),
+                ChangeType::SignatureChanged => (
+                    "⌁".yellow().to_string(),
+                    "[signature]".yellow().to_string(),
+                ),
             };
 
             let type_label = format!("{:<10}", change.entity_type);
@@ -154,7 +158,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                             }
                         }
                     }
-                    ChangeType::Modified | ChangeType::Renamed | ChangeType::Moved => {
+                    ChangeType::Modified | ChangeType::Renamed | ChangeType::Moved | ChangeType::SignatureChanged => {
                         if let (Some(before), Some(after)) =
                             (&change.before_content, &change.after_content)
                         {
@@ -221,7 +225,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                     }
                     _ => {}
                 }
-            } else if change.change_type == ChangeType::Modified {
+            } else if matches!(change.change_type, ChangeType::Modified | ChangeType::SignatureChanged) {
                 if let (Some(before), Some(after)) =
                     (&change.before_content, &change.after_content)
                 {

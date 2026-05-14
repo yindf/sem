@@ -51,7 +51,7 @@ impl SemanticParserPlugin for MarkdownParserPlugin {
                 }
 
                 let parent_id = section_stack.last().map(|(_, parent_name)| {
-                    build_entity_id(file_path, "heading", parent_name, None)
+                    build_entity_id(file_path, "heading", parent_name, None, None)
                 });
 
                 current_section = Some(Section {
@@ -98,10 +98,11 @@ impl SemanticParserPlugin for MarkdownParserPlugin {
             };
 
             entities.push(SemanticEntity {
-                id: build_entity_id(file_path, entity_type, &section.name, None),
+                id: build_entity_id(file_path, entity_type, &section.name, None, None),
                 file_path: file_path.to_string(),
                 entity_type: entity_type.to_string(),
                 name: section.name.clone(),
+                signature: None,
                 parent_id: section.parent_id.clone(),
                 content_hash: content_hash(&section_content),
                 structural_hash: None,

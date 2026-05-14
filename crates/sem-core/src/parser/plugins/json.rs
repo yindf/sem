@@ -73,6 +73,7 @@ fn extract_entries(content: &str, file_path: &str) -> Vec<SemanticEntity> {
                 file_path: file_path.to_string(),
                 entity_type: entry.entity_type.clone(),
                 name: entry.key.clone(),
+                signature: None,
                 parent_id: frame.parent_entity_id.clone(),
                 content_hash: content_hash(&entity_content),
                 structural_hash: Some(content_hash(value_content)),

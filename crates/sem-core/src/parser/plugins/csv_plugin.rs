@@ -45,10 +45,11 @@ impl SemanticParserPlugin for CsvParserPlugin {
             }
 
             entities.push(SemanticEntity {
-                id: build_entity_id(file_path, "row", &name, None),
+                id: build_entity_id(file_path, "row", &name, None, None),
                 file_path: file_path.to_string(),
                 entity_type: "row".to_string(),
                 name,
+                signature: None,
                 parent_id: None,
                 content_hash: content_hash(line),
                 structural_hash: None,
