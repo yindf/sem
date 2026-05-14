@@ -351,6 +351,7 @@ fn detect_orphan_changes(
         parent_name: None,
         file_path: file.file_path.clone(),
         old_entity_name: None,
+        signature: None,
         old_signature: None,
         old_file_path: None,
         old_parent_id: None,

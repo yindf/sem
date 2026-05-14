@@ -108,28 +108,31 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
             };
 
             let type_label = format!("{:<10}", change.entity_type);
+            // Build display name with signature info for overloads
+            let sig_suffix = match (&change.signature, &change.old_signature) {
+                (Some(sig), Some(old_sig)) => format!("{old_sig} -> {sig}"),
+                (Some(sig), None) => sig.clone(),
+                (None, Some(old_sig)) => format!("{old_sig} -> ..."),
+                (None, None) => String::new(),
+            };
             let base_name = if let Some(ref old_name) = change.old_entity_name {
-                format!("{old_name} -> {}", change.entity_name)
-            } else {
+                if sig_suffix.is_empty() {
+                    format!("{old_name} -> {}", change.entity_name)
+                } else {
+                    format!("{old_name} -> {}{sig_suffix}", change.entity_name)
+                }
+            } else if sig_suffix.is_empty() {
                 change.entity_name.clone()
-            };
-            let display_name = match &change.parent_name {
-                Some(p) => format!("{p}::{base_name}"),
-                None => base_name,
-            };
-            let truncated = if display_name.len() > 25 {
-                format!("{}…", display_name.char_indices().nth(24).map(|(i, _)| &display_name[..i]).unwrap_or(&display_name))
             } else {
-                display_name
+                format!("{}{sig_suffix}", change.entity_name)
             };
-            let name_label = format!("{:<25}", truncated);
 
             lines.push(format!(
                 "{}  {} {} {} {}",
                 "│".dimmed(),
                 symbol,
                 type_label.dimmed(),
-                name_label.bold(),
+                base_name.bold(),
                 tag,
             ));
 

@@ -42,6 +42,9 @@ pub struct SemanticChange {
     pub file_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_entity_name: Option<String>,
+    /// Current entity signature (for overload disambiguation display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
     /// Previous signature before a signature change (Phase 1.5 detection).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_signature: Option<String>,

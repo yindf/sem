@@ -95,7 +95,7 @@ struct LogEntry {
 pub fn log_command(opts: LogOptions) {
     let root = Path::new(&opts.cwd);
     let registry = super::create_registry(&opts.cwd);
-    let query = parse_entity_query(&opts.entity_name);
+    let mut query = parse_entity_query(&opts.entity_name);
 
     let bridge = match GitBridge::open(root) {
         Ok(b) => b,
@@ -159,6 +159,7 @@ pub fn log_command(opts: LogOptions) {
     }
 
     // Walk commits, tracking entity across file moves
+    // The outer 'walk loop supports restarting when a rename predecessor is detected.
     let mut current_git_file = git_file_path.clone();
     let mut entries: Vec<LogEntry> = Vec::new();
     let mut prev_entity_content: Option<String> = None;
@@ -170,6 +171,24 @@ pub fn log_command(opts: LogOptions) {
     let mut found_at_least_once = false;
     let mut total_commits = 0usize;
     let mut skip_until_sha: Option<String> = None;
+    let mut restart_with: Option<(String, Option<String>)> = None;
+
+    'walk: loop {
+        if let Some((new_name, new_sig)) = restart_with.take() {
+            query.name = new_name;
+            query.signature = new_sig;
+            current_git_file = git_file_path.clone();
+            entries.clear();
+            prev_entity_content = None;
+            prev_structural_hash = None;
+            prev_content_hash = None;
+            prev_entity_name = query.name.clone();
+            prev_entity_signature = query.signature.clone();
+            entity_type = String::new();
+            found_at_least_once = false;
+            total_commits = 0;
+            skip_until_sha = None;
+        }
 
     loop {
         let commits = match bridge.get_file_commits(&current_git_file, opts.limit) {
@@ -205,7 +224,7 @@ pub fn log_command(opts: LogOptions) {
         total_commits += reversed.len().saturating_sub(start_idx);
         let mut moved = false;
 
-        for commit in &reversed[start_idx..] {
+        for (idx, commit) in reversed[start_idx..].iter().enumerate() {
             let file_content = bridge
                 .read_file_at_ref(&commit.sha, &current_git_file)
                 .ok()
@@ -255,6 +274,36 @@ pub fn log_command(opts: LogOptions) {
                             old_name: None,
                             old_signature: None,
                         });
+
+                        // Lookback: check previous (older) commit for a renamed predecessor.
+                        // If the entity was renamed, the commit just before this one would have
+                        // an entity with a different name but very similar content.
+                        let actual_idx = idx + start_idx;
+                        if actual_idx > 0 {
+                            let prev_commit = reversed[actual_idx - 1];
+                            let prev_file_content = bridge
+                                .read_file_at_ref(&prev_commit.sha, &current_git_file)
+                                .ok()
+                                .flatten();
+                            let prev_entities: Vec<SemanticEntity> = prev_file_content
+                                .as_ref()
+                                .map(|c| registry.extract_entities(&current_git_file, c))
+                                .unwrap_or_default();
+
+                            let best_predecessor = prev_entities
+                                .iter()
+                                .filter(|e| e.name != query.name && e.entity_type == ent.entity_type)
+                                .filter_map(|e| {
+                                    let score = jaccard_similarity(&ent.content, &e.content);
+                                    if score >= 0.5 { Some((e, score)) } else { None }
+                                })
+                                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                            if let Some((pred, _score)) = best_predecessor {
+                                restart_with = Some((pred.name.clone(), pred.signature.clone()));
+                                continue 'walk;
+                            }
+                        }
                     } else if prev_entity_content.is_none() {
                         entries.push(LogEntry {
                             short_sha: commit.short_sha.clone(),
@@ -453,6 +502,8 @@ pub fn log_command(opts: LogOptions) {
         print_json(&query, &display_file, &entity_type, &entries, opts.verbose);
     } else {
         print_terminal(&query, &display_file, was_file.as_deref(), &entity_type, &entries, total_commits, &first_seen, opts.verbose);
+    }
+    break 'walk;
     }
 }
 
@@ -817,6 +868,32 @@ fn find_entity_in_commit(
                         old_signature: None,
                     });
                 }
+            }
+        }
+    }
+
+    // Phase C fallback: Jaccard similarity for renames where content hash changed
+    // (e.g. method name appears in the body, causing hash to differ)
+    if let Some(prev_content) = prev_entity_content {
+        let rename_candidates: Vec<&SemanticEntity> = entities
+            .iter()
+            .filter(|e| e.name != query_name)
+            .collect();
+
+        if !rename_candidates.is_empty() {
+            let best = rename_candidates
+                .iter()
+                .map(|e| (e, jaccard_similarity(prev_content, &e.content)))
+                .filter(|(_, score)| *score >= 0.5)
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            if let Some((ent, _score)) = best {
+                return Some(MatchedEntity {
+                    entity: (*ent).clone(),
+                    match_type: Some(EntityChangeType::Renamed),
+                    old_name: Some(prev_name.to_string()),
+                    old_signature: None,
+                });
             }
         }
     }

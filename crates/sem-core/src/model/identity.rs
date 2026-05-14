@@ -84,6 +84,7 @@ fn make_change(
         old_entity_name: before_entity.and_then(|b| {
             (b.name != after_entity.name).then(|| b.name.clone())
         }),
+        signature: primary.signature.clone(),
         old_signature: before_entity.and_then(|b| {
             (b.signature != after_entity.signature).then(|| b.signature.clone()).flatten()
         }),
