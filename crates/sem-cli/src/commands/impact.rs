@@ -30,7 +30,7 @@ pub fn impact_command(opts: ImpactOptions) {
     let file_paths = super::graph::find_supported_files_public(root, &registry, &ext_filter);
     let (graph, all_entities) = super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
 
-    let entity = find_entity(&graph, opts.entity_name.as_deref(), opts.entity_id.as_deref(), opts.file_hint.as_deref());
+    let entity = find_entity(&graph, &all_entities, opts.entity_name.as_deref(), opts.entity_id.as_deref(), opts.file_hint.as_deref());
 
     match opts.mode {
         ImpactMode::Deps => print_deps(&graph, entity, opts.json),
@@ -42,6 +42,7 @@ pub fn impact_command(opts: ImpactOptions) {
 
 fn find_entity<'a>(
     graph: &'a EntityGraph,
+    all_entities: &[sem_core::model::entity::SemanticEntity],
     name: Option<&str>,
     entity_id: Option<&str>,
     file_hint: Option<&str>,
@@ -60,21 +61,76 @@ fn find_entity<'a>(
         std::process::exit(1);
     });
 
-    let mut matching: Vec<_> = graph.entities.values().filter(|e| e.name == name).collect();
+    // Parse "Name(Signature)" syntax
+    let (query_name, query_signature) = if let Some(open) = name.rfind('(') {
+        if name.ends_with(')') && open > 0 {
+            (&name[..open], Some(&name[open..]))
+        } else {
+            (name, None)
+        }
+    } else {
+        (name, None)
+    };
+
+    // Find matching entities by name (and optionally signature)
+    let matching: Vec<&sem_core::model::entity::SemanticEntity> = if let Some(sig) = query_signature {
+        all_entities.iter().filter(|e| e.name == query_name && e.signature.as_deref() == Some(sig)).collect()
+    } else {
+        all_entities.iter().filter(|e| e.name == query_name).collect()
+    };
 
     if matching.is_empty() {
         eprintln!("{} Entity '{}' not found", "error:".red().bold(), name);
         std::process::exit(1);
     }
 
+    // Check for overloads when no signature specified
+    if query_signature.is_none() && matching.len() > 1 {
+        eprintln!(
+            "{} Entity '{}' has {} overloads:",
+            "error:".red().bold(),
+            query_name,
+            matching.len()
+        );
+        for e in &matching {
+            let sig = e.signature.as_deref().unwrap_or("n/a");
+            eprintln!(
+                "  {} {}{} (L{}:{})",
+                e.entity_type, e.name, sig, e.start_line, e.end_line
+            );
+        }
+        let example_sig = matching[0]
+            .signature
+            .as_deref()
+            .unwrap_or("()");
+        eprintln!(
+            "\nSpecify the signature to disambiguate: sem impact \"{}{}\"",
+            query_name, example_sig
+        );
+        std::process::exit(1);
+    }
+
+    // Filter by file hint
+    let target = if let Some(file) = file_hint {
+        matching.iter().find(|e| e.file_path == file).copied().unwrap_or(matching[0])
+    } else {
+        matching[0]
+    };
+
+    // Look up in graph by entity ID
+    if let Some(e) = graph.entities.get(&target.id) {
+        return e;
+    }
+
+    // Fallback: match by name in graph (old behavior)
+    let mut graph_matching: Vec<_> = graph.entities.values().filter(|e| e.name == query_name).collect();
     if let Some(file) = file_hint {
-        if let Some(e) = matching.iter().find(|e| e.file_path == file) {
+        if let Some(e) = graph_matching.iter().find(|e| e.file_path == file) {
             return e;
         }
     }
-
-    matching.sort_by_key(|e| (&e.file_path, e.start_line));
-    matching[0]
+    graph_matching.sort_by_key(|e| (&e.file_path, e.start_line));
+    graph_matching[0]
 }
 
 fn entity_json(e: &sem_core::parser::graph::EntityInfo) -> serde_json::Value {
@@ -323,5 +379,149 @@ fn print_all(
         }
 
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sem_core::model::entity::SemanticEntity;
+    use sem_core::parser::graph::EntityInfo;
+    use std::collections::HashMap;
+
+    fn make_entity(name: &str, signature: Option<&str>, line: usize) -> SemanticEntity {
+        let sig_str = signature.unwrap_or("");
+        SemanticEntity {
+            id: format!("svc.cs::method::{name}{sig_str}"),
+            file_path: "svc.cs".to_string(),
+            entity_type: "method".to_string(),
+            name: name.to_string(),
+            signature: signature.map(|s| s.to_string()),
+            parent_id: None,
+            content: String::new(),
+            content_hash: format!("hash_{name}_{line}"),
+            structural_hash: None,
+            start_line: line,
+            end_line: line + 10,
+            metadata: None,
+        }
+    }
+
+    fn build_graph(entities: &[SemanticEntity]) -> (EntityGraph, Vec<SemanticEntity>) {
+        let graph_entities: HashMap<String, EntityInfo> = entities.iter().map(|e| {
+            (e.id.clone(), EntityInfo {
+                id: e.id.clone(),
+                name: e.name.clone(),
+                entity_type: e.entity_type.clone(),
+                file_path: e.file_path.clone(),
+                parent_id: e.parent_id.clone(),
+                start_line: e.start_line,
+                end_line: e.end_line,
+            })
+        }).collect();
+        (EntityGraph::from_parts(graph_entities, vec![]), entities.to_vec())
+    }
+
+    #[test]
+    fn test_find_entity_by_signature_picks_correct_overload() {
+        let entities = vec![
+            make_entity("Process", Some("(int)"), 10),
+            make_entity("Process", Some("(string)"), 30),
+        ];
+        let (graph, all) = build_graph(&entities);
+
+        let result = find_entity(&graph, &all, Some("Process(int)"), None, None);
+        assert_eq!(result.id, "svc.cs::method::Process(int)");
+        assert_eq!(result.start_line, 10);
+    }
+
+    #[test]
+    fn test_find_entity_by_different_signature() {
+        let entities = vec![
+            make_entity("Process", Some("(int)"), 10),
+            make_entity("Process", Some("(string)"), 30),
+        ];
+        let (graph, all) = build_graph(&entities);
+
+        let result = find_entity(&graph, &all, Some("Process(string)"), None, None);
+        assert_eq!(result.id, "svc.cs::method::Process(string)");
+        assert_eq!(result.start_line, 30);
+    }
+
+    #[test]
+    fn test_find_entity_single_no_signature_needed() {
+        let entities = vec![
+            make_entity("Handle", None, 50),
+        ];
+        let (graph, all) = build_graph(&entities);
+
+        let result = find_entity(&graph, &all, Some("Handle"), None, None);
+        assert_eq!(result.name, "Handle");
+    }
+
+    #[test]
+    fn test_find_entity_by_id_bypasses_name() {
+        let entities = vec![
+            make_entity("Process", Some("(int)"), 10),
+            make_entity("Process", Some("(string)"), 30),
+        ];
+        let (graph, all) = build_graph(&entities);
+
+        let result = find_entity(&graph, &all, None, Some("svc.cs::method::Process(string)"), None);
+        assert_eq!(result.id, "svc.cs::method::Process(string)");
+    }
+
+    #[test]
+    fn test_find_entity_file_hint_with_overloads() {
+        let mut e1 = make_entity("Process", Some("(int)"), 10);
+        e1.file_path = "a.cs".to_string();
+        e1.id = "a.cs::method::Process(int)".to_string();
+        let mut e2 = make_entity("Process", Some("(int)"), 20);
+        e2.file_path = "b.cs".to_string();
+        e2.id = "b.cs::method::Process(int)".to_string();
+        let entities = vec![e1, e2];
+        let (graph, all) = build_graph(&entities);
+
+        let result = find_entity(&graph, &all, Some("Process(int)"), None, Some("b.cs"));
+        assert_eq!(result.file_path, "b.cs");
+    }
+
+    #[test]
+    fn test_find_entity_single_overload_no_signature_ok() {
+        let entities = vec![
+            make_entity("Process", Some("(int)"), 10),
+            make_entity("Handle", None, 50),
+        ];
+        let (graph, all) = build_graph(&entities);
+
+        let result = find_entity(&graph, &all, Some("Process"), None, None);
+        assert_eq!(result.id, "svc.cs::method::Process(int)");
+    }
+
+    #[test]
+    fn test_find_entity_empty_params_matches_no_signature() {
+        // "ResumeAllDown()" should match entity with signature=Some("()")
+        let entities = vec![
+            make_entity("ResumeAllDown", Some("()"), 199),
+            make_entity("ResumeAllDown", Some("(bool)"), 467),
+        ];
+        let (graph, all) = build_graph(&entities);
+
+        let result = find_entity(&graph, &all, Some("ResumeAllDown()"), None, None);
+        assert_eq!(result.id, "svc.cs::method::ResumeAllDown()");
+        assert_eq!(result.start_line, 199);
+    }
+
+    #[test]
+    fn test_find_entity_nonempty_signature_still_works() {
+        let entities = vec![
+            make_entity("ResumeAllDown", Some("()"), 199),
+            make_entity("ResumeAllDown", Some("(bool)"), 467),
+        ];
+        let (graph, all) = build_graph(&entities);
+
+        let result = find_entity(&graph, &all, Some("ResumeAllDown(bool)"), None, None);
+        assert_eq!(result.id, "svc.cs::method::ResumeAllDown(bool)");
+        assert_eq!(result.start_line, 467);
     }
 }

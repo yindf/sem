@@ -1708,7 +1708,7 @@ fn extract_param_types_from_list(params_node: Node, source: &[u8]) -> Option<Str
     }
 
     if types.is_empty() {
-        return None;
+        return Some("()".to_string());
     }
 
     Some(format!("({})", types.join(",")))

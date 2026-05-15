@@ -1897,9 +1897,9 @@ mod tests {
         );
 
         assert_eq!(graph.entities.len(), 3);
-        assert!(graph.entities.contains_key("c.ts::function::baz"));
+        assert!(graph.entities.contains_key("c.ts::function::baz()"));
         // baz references foo
-        let baz_deps = graph.get_dependencies("c.ts::function::baz");
+        let baz_deps = graph.get_dependencies("c.ts::function::baz()");
         assert!(
             baz_deps.iter().any(|d| d.name == "foo"),
             "baz should depend on foo. Deps: {:?}",
@@ -1932,9 +1932,9 @@ mod tests {
         );
 
         assert_eq!(graph.entities.len(), 1);
-        assert!(!graph.entities.contains_key("b.ts::function::bar"));
+        assert!(!graph.entities.contains_key("b.ts::function::bar()"));
         // foo's dependency on bar should be pruned
-        let foo_deps = graph.get_dependencies("a.ts::function::foo");
+        let foo_deps = graph.get_dependencies("a.ts::function::foo()");
         assert!(
             foo_deps.is_empty(),
             "foo's deps should be empty after bar deleted. Deps: {:?}",
@@ -1969,7 +1969,7 @@ mod tests {
 
         assert_eq!(graph.entities.len(), 3);
         // foo should now depend on baz, not bar
-        let foo_deps = graph.get_dependencies("a.ts::function::foo");
+        let foo_deps = graph.get_dependencies("a.ts::function::foo()");
         let dep_names: Vec<&str> = foo_deps.iter().map(|d| d.name.as_str()).collect();
         assert!(dep_names.contains(&"baz"), "foo should depend on baz after modification. Deps: {:?}", dep_names);
         assert!(!dep_names.contains(&"bar"), "foo should no longer depend on bar. Deps: {:?}", dep_names);
@@ -1998,7 +1998,7 @@ mod tests {
         );
 
         assert_eq!(graph.entities.len(), 2);
-        let bar_deps = graph.get_dependencies("b.ts::function::bar");
+        let bar_deps = graph.get_dependencies("b.ts::function::bar()");
         assert!(bar_deps.iter().any(|d| d.name == "foo"));
     }
 

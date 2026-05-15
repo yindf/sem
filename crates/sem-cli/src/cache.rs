@@ -44,6 +44,7 @@ impl DiskCache {
                  content_hash TEXT NOT NULL,
                  structural_hash TEXT,
                  parent_id TEXT,
+                 signature TEXT,
                  metadata_json TEXT
              );
              CREATE TABLE IF NOT EXISTS edges (
@@ -86,7 +87,7 @@ impl DiskCache {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, signature, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?;
             for e in entities {
                 let metadata_json = e
@@ -104,6 +105,7 @@ impl DiskCache {
                     e.content_hash,
                     e.structural_hash,
                     e.parent_id,
+                    e.signature,
                     metadata_json,
                 ])?;
             }
@@ -162,11 +164,11 @@ impl DiskCache {
 
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, signature, metadata_json FROM entities")
             .ok()?;
         let entities: Vec<SemanticEntity> = entity_stmt
             .query_map([], |row| {
-                let metadata_json: Option<String> = row.get(10)?;
+                let metadata_json: Option<String> = row.get(11)?;
                 let metadata = metadata_json.and_then(|j| serde_json::from_str(&j).ok());
                 Ok(SemanticEntity {
                     id: row.get(0)?,
@@ -179,8 +181,8 @@ impl DiskCache {
                     content_hash: row.get(7)?,
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
+                    signature: row.get(10)?,
                     metadata,
-                    signature: None,
                 })
             })
             .ok()?
@@ -308,11 +310,11 @@ impl DiskCache {
         // Load ALL entities, split into clean vs stale-file
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, signature, metadata_json FROM entities")
             .ok()?;
         let all_cached: Vec<SemanticEntity> = entity_stmt
             .query_map([], |row| {
-                let metadata_json: Option<String> = row.get(10)?;
+                let metadata_json: Option<String> = row.get(11)?;
                 let metadata = metadata_json.and_then(|j| serde_json::from_str(&j).ok());
                 Ok(SemanticEntity {
                     id: row.get(0)?,
@@ -325,8 +327,8 @@ impl DiskCache {
                     content_hash: row.get(7)?,
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
+                    signature: row.get(10)?,
                     metadata,
-                    signature: None,
                 })
             })
             .ok()?

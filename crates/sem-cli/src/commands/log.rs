@@ -175,21 +175,16 @@ pub fn log_command(opts: LogOptions) {
                 file_path
             );
             for e in &overloads {
-                match &e.signature {
-                    Some(sig) => eprintln!(
-                        "  {} {}{} (L{}:{})",
-                        e.entity_type, e.name, sig, e.start_line, e.end_line
-                    ),
-                    None => eprintln!(
-                        "  {} {} (L{}:{})",
-                        e.entity_type, e.name, e.start_line, e.end_line
-                    ),
-                }
+                let sig = e.signature.as_deref().unwrap_or("n/a");
+                eprintln!(
+                    "  {} {}{} (L{}:{})",
+                    e.entity_type, e.name, sig, e.start_line, e.end_line
+                );
             }
-            let example_sig = overloads
-                .iter()
-                .find_map(|e| e.signature.as_deref())
-                .unwrap_or("(...)");
+            let example_sig = overloads[0]
+                .signature
+                .as_deref()
+                .unwrap_or("()");
             eprintln!(
                 "\nSpecify the signature to disambiguate: sem log \"{}{}\"",
                 query.name, example_sig
@@ -806,7 +801,6 @@ fn find_entity_in_commit(
 
     // Phase A: Exact (name, signature) match
     if let Some(sig) = query_signature {
-        // Exact signature match
         if let Some(ent) = entities.iter().find(|e| e.name == query_name && e.signature.as_deref() == Some(sig)) {
             return Some(MatchedEntity {
                 entity: ent.clone(),
@@ -1843,5 +1837,73 @@ mod tests {
         // These have similar structure but different names/signatures
         // Score should be moderate, but with signature filter it won't matter
         assert!(score < 0.9, "different methods should have lower Jaccard, got {score}");
+    }
+
+    // --- empty params "()" matching tests ---
+
+    #[test]
+    fn test_parse_entity_query_empty_params_overload() {
+        let q = parse_entity_query("ResumeAllDown()");
+        assert_eq!(q.name, "ResumeAllDown");
+        assert_eq!(q.signature.as_deref(), Some("()"));
+    }
+
+    #[test]
+    fn test_find_entity_in_commit_empty_params_matches_no_signature() {
+        // "ResumeAllDown()" should match entity with signature=Some("()")
+        let entities = vec![
+            SemanticEntity {
+                id: "svc.cs::method::ResumeAllDown".to_string(),
+                file_path: "svc.cs".to_string(),
+                entity_type: "method".to_string(),
+                name: "ResumeAllDown".to_string(),
+                signature: Some("()".to_string()),
+                parent_id: None,
+                content: "void ResumeAllDown() { }".to_string(),
+                content_hash: "hash1".to_string(),
+                structural_hash: None,
+                start_line: 199,
+                end_line: 209,
+                metadata: None,
+            },
+            SemanticEntity {
+                id: "svc.cs::method::ResumeAllDown(bool)".to_string(),
+                file_path: "svc.cs".to_string(),
+                entity_type: "method".to_string(),
+                name: "ResumeAllDown".to_string(),
+                signature: Some("(bool)".to_string()),
+                parent_id: None,
+                content: "void ResumeAllDown(bool x) { }".to_string(),
+                content_hash: "hash2".to_string(),
+                structural_hash: None,
+                start_line: 467,
+                end_line: 603,
+                metadata: None,
+            },
+        ];
+        let result = find_entity_in_commit(
+            &entities, "ResumeAllDown", Some("()"),
+            "ResumeAllDown", None,
+            None, None, None,
+        );
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.entity.signature.as_deref(), Some("()"));
+        assert_eq!(m.entity.start_line, 199);
+    }
+
+    #[test]
+    fn test_find_entity_in_commit_nonempty_signature_matches() {
+        let entities = vec![
+            make_entity("ResumeAllDown", Some("()"), "hash1", None),
+            make_entity("ResumeAllDown", Some("(bool)"), "hash2", None),
+        ];
+        let result = find_entity_in_commit(
+            &entities, "ResumeAllDown", Some("(bool)"),
+            "ResumeAllDown", Some("(bool)"),
+            None, None, None,
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().entity.signature.as_deref(), Some("(bool)"));
     }
 }

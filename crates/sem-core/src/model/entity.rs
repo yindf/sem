@@ -8,9 +8,9 @@ pub struct SemanticEntity {
     pub file_path: String,
     pub entity_type: String,
     pub name: String,
-    /// Parameter signature for method overload disambiguation.
-    /// For code entities this is a normalized form like "(int,string)".
-    /// None for non-code entities or when no parameters exist.
+    /// Parameter signature for code entities.
+    /// For methods this is a normalized form like "()" or "(int,string)".
+    /// None for non-code entities (classes, interfaces, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
