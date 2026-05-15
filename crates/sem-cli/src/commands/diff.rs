@@ -22,6 +22,7 @@ pub struct DiffOptions {
     pub verbose: bool,
     pub profile: bool,
     pub file_exts: Vec<String>,
+    pub file: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -465,6 +466,17 @@ fn run_diff_pipeline(
         file_changes.into_iter().filter(|fc| {
             exts.iter().any(|ext| fc.file_path.ends_with(ext.as_str()))
         }).collect()
+    };
+
+    // Filter by specific file if specified
+    let file_changes = if let Some(ref file) = opts.file {
+        let normalized = file.replace('\\', "/");
+        file_changes.into_iter().filter(|fc| {
+            let fp = fc.file_path.replace('\\', "/");
+            fp == normalized || fp.ends_with(&normalized) || normalized.ends_with(&fp)
+        }).collect()
+    } else {
+        file_changes
     };
 
     if file_changes.is_empty() {

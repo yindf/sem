@@ -81,6 +81,10 @@ enum Commands {
         #[arg(long, num_args = 1..)]
         file_exts: Vec<String>,
 
+        /// Only show changes for this file
+        #[arg(long)]
+        file: Option<String>,
+
         /// When to use colors
         #[arg(long, default_value = "auto")]
         color: ColorMode,
@@ -181,9 +185,13 @@ enum Commands {
         #[arg(long)]
         file: Option<String>,
 
-        /// Maximum number of commits to scan
-        #[arg(long, default_value = "50")]
+        /// Maximum number of entity changes to show (default 10)
+        #[arg(long, default_value = "10")]
         limit: usize,
+
+        /// Maximum number of file-changing commits to scan (default 500)
+        #[arg(long, default_value = "500")]
+        scan_limit: usize,
 
         /// Output format
         #[arg(long, value_parser = ["terminal", "json"])]
@@ -311,6 +319,7 @@ fn main() {
             format,
             profile,
             file_exts,
+            file,
             color,
             directory,
         }) => {
@@ -335,6 +344,7 @@ fn main() {
                 verbose,
                 profile,
                 file_exts,
+                file,
                 args,
             });
         }
@@ -413,6 +423,7 @@ fn main() {
             entity,
             file,
             limit,
+            scan_limit,
             format,
             json,
             verbose,
@@ -425,6 +436,7 @@ fn main() {
                 entity_name: entity,
                 file_path: file,
                 limit,
+                scan_limit,
                 json: resolve_json(format, json),
                 verbose,
             });
@@ -517,6 +529,7 @@ fn main() {
                 verbose: false,
                 profile: false,
                 file_exts: vec![],
+                file: None,
                 args: vec![],
             });
         }

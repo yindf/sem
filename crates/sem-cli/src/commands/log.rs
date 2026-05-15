@@ -34,6 +34,7 @@ pub struct LogOptions {
     pub entity_name: String,
     pub file_path: Option<String>,
     pub limit: usize,
+    pub scan_limit: usize,
     pub json: bool,
     pub verbose: bool,
 }
@@ -158,8 +159,46 @@ pub fn log_command(opts: LogOptions) {
         std::process::exit(1);
     }
 
+    // Check for overloads when no signature specified
+    if query.signature.is_none() {
+        let check_entities = registry.extract_entities(&file_path, &file_content_hint);
+        let overloads: Vec<&SemanticEntity> = check_entities
+            .iter()
+            .filter(|e| e.name == query.name)
+            .collect();
+        if overloads.len() > 1 {
+            eprintln!(
+                "{} Entity '{}' has {} overloads in {}:",
+                "error:".red().bold(),
+                opts.entity_name,
+                overloads.len(),
+                file_path
+            );
+            for e in &overloads {
+                match &e.signature {
+                    Some(sig) => eprintln!(
+                        "  {} {}{} (L{}:{})",
+                        e.entity_type, e.name, sig, e.start_line, e.end_line
+                    ),
+                    None => eprintln!(
+                        "  {} {} (L{}:{})",
+                        e.entity_type, e.name, e.start_line, e.end_line
+                    ),
+                }
+            }
+            let example_sig = overloads
+                .iter()
+                .find_map(|e| e.signature.as_deref())
+                .unwrap_or("(...)");
+            eprintln!(
+                "\nSpecify the signature to disambiguate: sem log \"{}{}\"",
+                query.name, example_sig
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Walk commits, tracking entity across file moves
-    // The outer 'walk loop supports restarting when a rename predecessor is detected.
     let mut current_git_file = git_file_path.clone();
     let mut entries: Vec<LogEntry> = Vec::new();
     let mut prev_entity_content: Option<String> = None;
@@ -171,27 +210,12 @@ pub fn log_command(opts: LogOptions) {
     let mut found_at_least_once = false;
     let mut total_commits = 0usize;
     let mut skip_until_sha: Option<String> = None;
-    let mut restart_with: Option<(String, Option<String>)> = None;
-
-    'walk: loop {
-        if let Some((new_name, new_sig)) = restart_with.take() {
-            query.name = new_name;
-            query.signature = new_sig;
-            current_git_file = git_file_path.clone();
-            entries.clear();
-            prev_entity_content = None;
-            prev_structural_hash = None;
-            prev_content_hash = None;
-            prev_entity_name = query.name.clone();
-            prev_entity_signature = query.signature.clone();
-            entity_type = String::new();
-            found_at_least_once = false;
-            total_commits = 0;
-            skip_until_sha = None;
-        }
+    // Prepend entries from a rename predecessor walk (filled after main walk)
+    let mut prepend_entries: Option<(Vec<LogEntry>, usize, String)> = None; // (entries, commits, predecessor_name)
 
     loop {
-        let commits = match bridge.get_file_commits(&current_git_file, opts.limit) {
+        // --scan-limit controls how many file-changing commits to scan.
+        let commits = match bridge.get_file_commits(&current_git_file, opts.scan_limit) {
             Ok(c) => c,
             Err(e) => {
                 if total_commits == 0 {
@@ -276,8 +300,7 @@ pub fn log_command(opts: LogOptions) {
                         });
 
                         // Lookback: check previous (older) commit for a renamed predecessor.
-                        // If the entity was renamed, the commit just before this one would have
-                        // an entity with a different name but very similar content.
+                        // Instead of restarting, we do a separate walk and prepend results.
                         let actual_idx = idx + start_idx;
                         if actual_idx > 0 {
                             let prev_commit = reversed[actual_idx - 1];
@@ -293,15 +316,27 @@ pub fn log_command(opts: LogOptions) {
                             let best_predecessor = prev_entities
                                 .iter()
                                 .filter(|e| e.name != query.name && e.entity_type == ent.entity_type)
+                                .filter(|e| e.signature == ent.signature)
                                 .filter_map(|e| {
                                     let score = jaccard_similarity(&ent.content, &e.content);
-                                    if score >= 0.5 { Some((e, score)) } else { None }
+                                    if score >= 0.7 { Some((e, score)) } else { None }
                                 })
                                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
                             if let Some((pred, _score)) = best_predecessor {
-                                restart_with = Some((pred.name.clone(), pred.signature.clone()));
-                                continue 'walk;
+                                // Do a separate walk for the predecessor and prepend results.
+                                // Don't touch current entries — just save the predecessor info
+                                // for a second walk after the main walk finishes.
+                                let pred_name = pred.name.clone();
+                                let (pred_ents, pred_commits) = walk_predecessor(
+                                    &bridge,
+                                    &registry,
+                                    &git_file_path,
+                                    pred,
+                                    &ent,
+                                    opts.scan_limit,
+                                );
+                                prepend_entries = Some((pred_ents, pred_commits, pred_name));
                             }
                         }
                     } else if prev_entity_content.is_none() {
@@ -479,6 +514,35 @@ pub fn log_command(opts: LogOptions) {
         std::process::exit(1);
     }
 
+    // Prepend predecessor entries if a rename was detected
+    if let Some((mut pred_entries, pred_commits, pred_name)) = prepend_entries.take() {
+        if !pred_entries.is_empty() {
+            total_commits += pred_commits;
+            // Insert a "Renamed" entry connecting predecessor to the current entity
+            pred_entries.push(LogEntry {
+                short_sha: entries[0].short_sha.clone(),
+                author: entries[0].author.clone(),
+                date: entries[0].date.clone(),
+                message: entries[0].message.clone(),
+                change_type: EntityChangeType::Renamed,
+                content: entries[0].content.clone(),
+                prev_content: pred_entries.last().and_then(|e| e.content.clone()),
+                file_path: entries[0].file_path.clone(),
+                prev_file_path: None,
+                old_name: Some(pred_name),
+                old_signature: None,
+            });
+            pred_entries.append(&mut entries);
+            entries = pred_entries;
+        }
+    }
+
+    // Keep only the most recent N entity changes
+    if entries.len() > opts.limit {
+        let total = entries.len();
+        entries.drain(..total - opts.limit);
+    }
+
     let first_seen = entries.first().map(|e| e.date.clone()).unwrap_or_default();
     // Use the last file the entity was seen in for the header
     let display_file = entries
@@ -502,8 +566,6 @@ pub fn log_command(opts: LogOptions) {
         print_json(&query, &display_file, &entity_type, &entries, opts.verbose);
     } else {
         print_terminal(&query, &display_file, was_file.as_deref(), &entity_type, &entries, total_commits, &first_seen, opts.verbose);
-    }
-    break 'walk;
     }
 }
 
@@ -877,7 +939,7 @@ fn find_entity_in_commit(
     if let Some(prev_content) = prev_entity_content {
         let rename_candidates: Vec<&SemanticEntity> = entities
             .iter()
-            .filter(|e| e.name != query_name)
+            .filter(|e| e.name != query_name && e.signature.as_deref() == prev_signature)
             .collect();
 
         if !rename_candidates.is_empty() {
@@ -1038,6 +1100,204 @@ fn search_entity_cross_file_v2(
     }
 
     None
+}
+
+/// Walk the history of a predecessor entity (detected by lookback) and return
+/// its entries + commit count. These entries will be prepended to the main walk.
+fn walk_predecessor(
+    bridge: &GitBridge,
+    registry: &ParserRegistry,
+    git_file_path: &str,
+    predecessor: &SemanticEntity,
+    current_entity: &SemanticEntity,
+    scan_limit: usize,
+) -> (Vec<LogEntry>, usize) {
+    let mut entries: Vec<LogEntry> = Vec::new();
+    let mut prev_entity_content: Option<String> = None;
+    let mut prev_structural_hash: Option<String> = None;
+    let mut prev_content_hash: Option<String> = None;
+    let mut prev_entity_name = predecessor.name.clone();
+    let mut prev_entity_signature = predecessor.signature.clone();
+    let mut total_commits = 0usize;
+    let mut skip_until_sha: Option<String> = None;
+    let mut current_git_file = git_file_path.to_string();
+
+    loop {
+        let commits = match bridge.get_file_commits(&current_git_file, scan_limit) {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        if commits.is_empty() { break; }
+
+        let reversed: Vec<_> = commits.iter().rev().collect();
+        let start_idx = if let Some(ref sha) = skip_until_sha {
+            reversed.iter().position(|c| c.sha == *sha).map(|i| i + 1).unwrap_or(reversed.len())
+        } else {
+            0
+        };
+        skip_until_sha = None;
+        total_commits += reversed.len().saturating_sub(start_idx);
+        let mut moved = false;
+
+        for commit in &reversed[start_idx..] {
+            let file_content = bridge.read_file_at_ref(&commit.sha, &current_git_file).ok().flatten();
+            let commit_entities: Vec<SemanticEntity> = file_content
+                .as_ref()
+                .map(|c| registry.extract_entities(&current_git_file, c))
+                .unwrap_or_default();
+
+            let found_match = find_entity_in_commit(
+                &commit_entities,
+                &prev_entity_name,
+                prev_entity_signature.as_deref(),
+                &prev_entity_name,
+                prev_entity_signature.as_deref(),
+                prev_content_hash.as_deref(),
+                prev_structural_hash.as_deref(),
+                prev_entity_content.as_deref(),
+            );
+
+            let date = chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0));
+            let msg_first_line = commit.message.lines().next().unwrap_or("").to_string();
+
+            match found_match {
+                Some(m) => {
+                    let ent = m.entity;
+                    let cur_content_hash = ent.content_hash.clone();
+                    let cur_structural_hash = ent.structural_hash.clone();
+
+                    if entries.is_empty() {
+                        entries.push(LogEntry {
+                            short_sha: commit.short_sha.clone(),
+                            author: commit.author.clone(),
+                            date,
+                            message: msg_first_line,
+                            change_type: EntityChangeType::Added,
+                            content: Some(ent.content.clone()),
+                            prev_content: None,
+                            file_path: Some(current_git_file.clone()),
+                            prev_file_path: None,
+                            old_name: None,
+                            old_signature: None,
+                        });
+                    } else if prev_entity_content.is_none() {
+                        entries.push(LogEntry {
+                            short_sha: commit.short_sha.clone(),
+                            author: commit.author.clone(),
+                            date,
+                            message: msg_first_line,
+                            change_type: EntityChangeType::Reappeared,
+                            content: Some(ent.content.clone()),
+                            prev_content: None,
+                            file_path: Some(current_git_file.clone()),
+                            prev_file_path: None,
+                            old_name: None,
+                            old_signature: None,
+                        });
+                    } else {
+                        let change_type = if let Some(mt) = m.match_type {
+                            mt
+                        } else {
+                            let content_changed = prev_content_hash.as_deref() != Some(cur_content_hash.as_str());
+                            if content_changed {
+                                let structural_changed = match (cur_structural_hash.as_deref(), prev_structural_hash.as_deref()) {
+                                    (Some(cur), Some(prev)) => cur != prev,
+                                    _ => true,
+                                };
+                                if structural_changed { EntityChangeType::ModifiedLogic }
+                                else { EntityChangeType::ModifiedCosmetic }
+                            } else {
+                                prev_entity_content = Some(ent.content.clone());
+                                prev_structural_hash = ent.structural_hash.clone();
+                                prev_content_hash = Some(cur_content_hash.clone());
+                                prev_entity_name = ent.name.clone();
+                                prev_entity_signature = ent.signature.clone();
+                                continue;
+                            }
+                        };
+                        entries.push(LogEntry {
+                            short_sha: commit.short_sha.clone(),
+                            author: commit.author.clone(),
+                            date,
+                            message: msg_first_line,
+                            change_type,
+                            content: Some(ent.content.clone()),
+                            prev_content: prev_entity_content.clone(),
+                            file_path: Some(current_git_file.clone()),
+                            prev_file_path: None,
+                            old_name: m.old_name,
+                            old_signature: m.old_signature,
+                        });
+                    }
+
+                    prev_entity_content = Some(ent.content.clone());
+                    prev_structural_hash = ent.structural_hash.clone();
+                    prev_content_hash = Some(ent.content_hash.clone());
+                    prev_entity_name = ent.name.clone();
+                    prev_entity_signature = ent.signature.clone();
+                }
+                None => {
+                    if prev_entity_content.is_some() {
+                        let cross = search_entity_cross_file_v2(
+                            bridge, registry, &commit.sha,
+                            &prev_entity_name, prev_entity_signature.as_deref(),
+                            prev_content_hash.as_deref(), prev_structural_hash.as_deref(),
+                            &prev_entity_name, prev_entity_signature.as_deref(),
+                            &current_git_file,
+                        );
+                        match cross {
+                            Some((new_file, ent, change_type, old_name, old_signature)) => {
+                                let prev_file = current_git_file.clone();
+                                entries.push(LogEntry {
+                                    short_sha: commit.short_sha.clone(),
+                                    author: commit.author.clone(),
+                                    date,
+                                    message: msg_first_line,
+                                    change_type,
+                                    content: Some(ent.content.clone()),
+                                    prev_content: prev_entity_content.clone(),
+                                    file_path: Some(new_file.clone()),
+                                    prev_file_path: Some(prev_file),
+                                    old_name,
+                                    old_signature,
+                                });
+                                prev_entity_content = Some(ent.content.clone());
+                                prev_structural_hash = ent.structural_hash.clone();
+                                prev_content_hash = Some(ent.content_hash.clone());
+                                prev_entity_name = ent.name.clone();
+                                prev_entity_signature = ent.signature.clone();
+                                skip_until_sha = Some(commit.sha.clone());
+                                current_git_file = new_file;
+                                moved = true;
+                                break;
+                            }
+                            None => {
+                                entries.push(LogEntry {
+                                    short_sha: commit.short_sha.clone(),
+                                    author: commit.author.clone(),
+                                    date,
+                                    message: msg_first_line,
+                                    change_type: EntityChangeType::Deleted,
+                                    content: None,
+                                    prev_content: prev_entity_content.take(),
+                                    file_path: Some(current_git_file.clone()),
+                                    prev_file_path: None,
+                                    old_name: None,
+                                    old_signature: None,
+                                });
+                                prev_structural_hash = None;
+                                prev_content_hash = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !moved { break; }
+    }
+
+    (entries, total_commits)
 }
 
 fn print_json(
@@ -1458,5 +1718,130 @@ mod tests {
         // Should match Process(string) as SignatureChanged via structural_hash
         assert_eq!(m.entity.name, "Process");
         assert!(matches!(m.match_type, Some(EntityChangeType::SignatureChanged)));
+    }
+
+    // --- Phase C signature filter tests ---
+
+    #[test]
+    fn test_rename_rejected_when_signature_differs() {
+        // RegisterDialogValidHandler(Func<int,bool>) should NOT match
+        // RegisterUpdateInterruptHandler(Action<GainInterruptReason>) — different signature
+        let prev_content = "public void RegisterUpdateInterruptHandler(Action<GainInterruptReason> func)\n{\n    UpdateInterruptHandler += func;\n}";
+        let other_content = "public void RegisterDialogValidHandler(Func<int, bool> func)\n{\n    DialogValidHandler += func;\n}";
+        let entities = vec![
+            SemanticEntity {
+                id: "file.cs::method::RegisterDialogValidHandler".to_string(),
+                file_path: "file.cs".to_string(),
+                entity_type: "method".to_string(),
+                name: "RegisterDialogValidHandler".to_string(),
+                signature: Some("(Func<int,bool>)".to_string()),
+                parent_id: None,
+                content: other_content.to_string(),
+                content_hash: "hash_dialog".to_string(),
+                structural_hash: None,
+                start_line: 1,
+                end_line: 10,
+                metadata: None,
+            },
+        ];
+        let result = find_entity_in_commit(
+            &entities, "RegisterUpdateInterruptHandler", Some("(Action<GainInterruptReason>)"),
+            "RegisterUpdateInterruptHandler", Some("(Action<GainInterruptReason>)"),
+            None, None,
+            Some(prev_content),
+        );
+        // Must NOT match: signatures are completely different
+        assert!(result.is_none(), "should not rename-match entities with different signatures");
+    }
+
+    #[test]
+    fn test_rename_accepted_when_signature_same() {
+        // GetDownPackageCount → GetDownPackageCountXXX with same signature (bool,bool,bool,int)
+        let prev_content = "public int GetDownPackageCount(bool a, bool b, bool c, int d)\n{\n    return 1;\n}";
+        let new_content =  "public int GetDownPackageCountXXX(bool a, bool b, bool c, int d)\n{\n    return 1;\n}";
+        let entities = vec![
+            SemanticEntity {
+                id: "file.cs::method::GetDownPackageCountXXX".to_string(),
+                file_path: "file.cs".to_string(),
+                entity_type: "method".to_string(),
+                name: "GetDownPackageCountXXX".to_string(),
+                signature: Some("(bool,bool,bool,int)".to_string()),
+                parent_id: None,
+                content: new_content.to_string(),
+                content_hash: "hash_xxx".to_string(),
+                structural_hash: None,
+                start_line: 1,
+                end_line: 10,
+                metadata: None,
+            },
+        ];
+        let result = find_entity_in_commit(
+            &entities, "GetDownPackageCount", Some("(bool,bool,bool,int)"),
+            "GetDownPackageCount", Some("(bool,bool,bool,int)"),
+            None, None,
+            Some(prev_content),
+        );
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.entity.name, "GetDownPackageCountXXX");
+        assert!(matches!(m.match_type, Some(EntityChangeType::Renamed)));
+        assert_eq!(m.old_name.as_deref(), Some("GetDownPackageCount"));
+    }
+
+    #[test]
+    fn test_rename_jaccard_rejected_different_signature_similar_body() {
+        // Two methods with similar structure but completely different signatures
+        // should NOT be matched as renames even with high Jaccard similarity
+        let prev_content = "public void Foo(int x)\n{\n    handler += x;\n}";
+        let other_content = "public void Bar(string y)\n{\n    handler += y;\n}";
+        let entities = vec![
+            SemanticEntity {
+                id: "file.cs::method::Bar".to_string(),
+                file_path: "file.cs".to_string(),
+                entity_type: "method".to_string(),
+                name: "Bar".to_string(),
+                signature: Some("(string)".to_string()),
+                parent_id: None,
+                content: other_content.to_string(),
+                content_hash: "hash_bar".to_string(),
+                structural_hash: None,
+                start_line: 1,
+                end_line: 10,
+                metadata: None,
+            },
+        ];
+        let result = find_entity_in_commit(
+            &entities, "Foo", Some("(int)"),
+            "Foo", Some("(int)"),
+            None, None,
+            Some(prev_content),
+        );
+        assert!(result.is_none(), "should not rename-match with different signatures");
+    }
+
+    // --- jaccard_similarity tests ---
+
+    #[test]
+    fn test_jaccard_identical_content() {
+        let content = "public void Foo(int x)\n{\n    return x;\n}";
+        assert_eq!(jaccard_similarity(content, content), 1.0);
+    }
+
+    #[test]
+    fn test_jaccard_rename_high_similarity() {
+        let old = "public int GetDownPackageCount(bool a, bool b, bool c, int d)\n{\n    return 1;\n}";
+        let new = "public int GetDownPackageCountXXX(bool a, bool b, bool c, int d)\n{\n    return 1;\n}";
+        let score = jaccard_similarity(old, new);
+        assert!(score >= 0.7, "rename should have high Jaccard similarity, got {score}");
+    }
+
+    #[test]
+    fn test_jaccard_different_methods_lower_similarity() {
+        let a = "public void RegisterUpdateInterruptHandler(Action<GainInterruptReason> func)\n{\n    UpdateInterruptHandler += func;\n}";
+        let b = "public void RegisterDialogValidHandler(Func<int, bool> func)\n{\n    DialogValidHandler += func;\n}";
+        let score = jaccard_similarity(a, b);
+        // These have similar structure but different names/signatures
+        // Score should be moderate, but with signature filter it won't matter
+        assert!(score < 0.9, "different methods should have lower Jaccard, got {score}");
     }
 }
