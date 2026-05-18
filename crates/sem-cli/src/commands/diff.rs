@@ -8,7 +8,9 @@ use sem_core::git::jj::maybe_resolve_ref;
 use sem_core::git::types::{DiffScope, FileChange};
 use sem_core::parser::differ::compute_semantic_diff;
 
-use crate::formatters::{json::format_json, markdown::format_markdown, plain::format_plain, terminal::format_terminal};
+use crate::formatters::{
+    json::format_json, markdown::format_markdown, plain::format_plain, terminal::format_terminal,
+};
 use crate::stats::SemLifetimeStats;
 
 pub struct DiffOptions {
@@ -70,7 +72,10 @@ fn parse_args(args: Vec<String>) -> ParsedArgs {
     let (refs, pathspecs) = split_on_separator(args);
 
     if refs.is_empty() {
-        return ParsedArgs { scope: None, pathspecs };
+        return ParsedArgs {
+            scope: None,
+            pathspecs,
+        };
     }
 
     if refs.len() == 1 {
@@ -82,7 +87,10 @@ fn parse_args(args: Vec<String>) -> ParsedArgs {
                 let from = if from.is_empty() { "HEAD" } else { from };
                 let to = if to.is_empty() { "HEAD" } else { to };
                 return ParsedArgs {
-                    scope: Some(ParsedScope::MergeBaseRange(from.to_string(), to.to_string())),
+                    scope: Some(ParsedScope::MergeBaseRange(
+                        from.to_string(),
+                        to.to_string(),
+                    )),
                     pathspecs,
                 };
             }
@@ -104,7 +112,10 @@ fn parse_args(args: Vec<String>) -> ParsedArgs {
         if Path::new(arg).exists() {
             let mut pathspecs = pathspecs;
             pathspecs.push(arg.clone());
-            return ParsedArgs { scope: None, pathspecs };
+            return ParsedArgs {
+                scope: None,
+                pathspecs,
+            };
         }
 
         // Single ref → compare to working tree
@@ -296,10 +307,12 @@ pub fn diff_command(mut opts: DiffOptions) {
     let (file_changes, from_stdin) = if opts.stdin {
         // Read FileChange[] from stdin — no git repo needed
         let mut input = String::new();
-        std::io::stdin().read_to_string(&mut input).unwrap_or_else(|e| {
-            eprintln!("\x1b[31mError reading stdin: {e}\x1b[0m");
-            process::exit(1);
-        });
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .unwrap_or_else(|e| {
+                eprintln!("\x1b[31mError reading stdin: {e}\x1b[0m");
+                process::exit(1);
+            });
         let changes: Vec<FileChange> = serde_json::from_str(&input).unwrap_or_else(|e| {
             eprintln!("\x1b[31mError parsing stdin JSON: {e}\x1b[0m");
             process::exit(1);
@@ -313,9 +326,14 @@ pub fn diff_command(mut opts: DiffOptions) {
         // If we're in a git repo and both resolve as refs, prefer ref comparison
         if let Ok(git) = GitBridge::open(Path::new(&opts.cwd)) {
             if git.is_valid_rev(a) && git.is_valid_rev(b) {
-                let scope = DiffScope::Range { from: a.clone(), to: b.clone() };
+                let scope = DiffScope::Range {
+                    from: a.clone(),
+                    to: b.clone(),
+                };
                 match git.get_changed_files(&scope, &parsed.pathspecs) {
-                    Ok(files) => return run_diff_pipeline(files, false, &opts, &parsed, total_start, t0),
+                    Ok(files) => {
+                        return run_diff_pipeline(files, false, &opts, &parsed, total_start, t0)
+                    }
                     Err(e) => {
                         eprintln!("\x1b[31mError: {e}\x1b[0m");
                         process::exit(1);
@@ -344,10 +362,12 @@ pub fn diff_command(mut opts: DiffOptions) {
     } else if opts.patch {
         // Read unified diff from stdin and parse it
         let mut input = String::new();
-        std::io::stdin().read_to_string(&mut input).unwrap_or_else(|e| {
-            eprintln!("\x1b[31mError reading stdin: {e}\x1b[0m");
-            process::exit(1);
-        });
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .unwrap_or_else(|e| {
+                eprintln!("\x1b[31mError reading stdin: {e}\x1b[0m");
+                process::exit(1);
+            });
         let changes = parse_unified_diff(&input, &opts.cwd);
         (changes, true)
     } else {
@@ -394,7 +414,9 @@ pub fn diff_command(mut opts: DiffOptions) {
                             to: "HEAD".to_string(),
                         }
                     } else {
-                        DiffScope::RefToWorking { refspec: refspec.clone() }
+                        DiffScope::RefToWorking {
+                            refspec: refspec.clone(),
+                        }
                     }
                 }
                 ParsedScope::Range(from, to) => DiffScope::Range {
@@ -460,12 +482,21 @@ fn run_diff_pipeline(
     let file_changes = if opts.file_exts.is_empty() {
         file_changes
     } else {
-        let exts: Vec<String> = opts.file_exts.iter().map(|e| {
-            if e.starts_with('.') { e.clone() } else { format!(".{}", e) }
-        }).collect();
-        file_changes.into_iter().filter(|fc| {
-            exts.iter().any(|ext| fc.file_path.ends_with(ext.as_str()))
-        }).collect()
+        let exts: Vec<String> = opts
+            .file_exts
+            .iter()
+            .map(|e| {
+                if e.starts_with('.') {
+                    e.clone()
+                } else {
+                    format!(".{}", e)
+                }
+            })
+            .collect();
+        file_changes
+            .into_iter()
+            .filter(|fc| exts.iter().any(|ext| fc.file_path.ends_with(ext.as_str())))
+            .collect()
     };
 
     if file_changes.is_empty() {
@@ -506,16 +537,26 @@ fn run_diff_pipeline(
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!();
         eprintln!("\x1b[2m── Profile ──────────────────────────────────\x1b[0m");
-        eprintln!("\x1b[2m  input ({})  {git_diff_ms:>8.2}ms\x1b[0m",
-            if from_stdin { "stdin" } else { "git" });
+        eprintln!(
+            "\x1b[2m  input ({})  {git_diff_ms:>8.2}ms\x1b[0m",
+            if from_stdin { "stdin" } else { "git" }
+        );
         eprintln!("\x1b[2m  registry init        {registry_ms:>8.2}ms\x1b[0m");
         eprintln!("\x1b[2m  parse + match        {parse_diff_ms:>8.2}ms\x1b[0m");
         eprintln!("\x1b[2m  format output        {format_ms:>8.2}ms\x1b[0m");
         eprintln!("\x1b[2m  ─────────────────────────────────────────────\x1b[0m");
         eprintln!("\x1b[2m  total                {total_ms:>8.2}ms\x1b[0m");
-        eprintln!("\x1b[2m  files: {}  entities: {}  changes: {}\x1b[0m",
-            file_changes.len(), result.changes.len(),
-            result.added_count + result.modified_count + result.deleted_count + result.moved_count + result.renamed_count + result.reordered_count);
+        eprintln!(
+            "\x1b[2m  files: {}  entities: {}  changes: {}\x1b[0m",
+            file_changes.len(),
+            result.changes.len(),
+            result.added_count
+                + result.modified_count
+                + result.deleted_count
+                + result.moved_count
+                + result.renamed_count
+                + result.reordered_count
+        );
         eprintln!("\x1b[2m─────────────────────────────────────────────\x1b[0m");
     }
 }
