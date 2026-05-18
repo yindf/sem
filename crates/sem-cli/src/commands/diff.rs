@@ -9,6 +9,7 @@ use sem_core::git::types::{DiffScope, FileChange};
 use sem_core::parser::differ::compute_semantic_diff;
 
 use crate::formatters::{json::format_json, markdown::format_markdown, plain::format_plain, terminal::format_terminal};
+use crate::stats::SemLifetimeStats;
 
 pub struct DiffOptions {
     pub cwd: String,
@@ -486,6 +487,9 @@ fn run_diff_pipeline(
     let t3 = Instant::now();
     let result = compute_semantic_diff(&file_changes, &registry, None, None);
     let parse_diff_ms = t3.elapsed().as_secs_f64() * 1000.0;
+
+    // Record lifetime stats (best-effort)
+    let _ = SemLifetimeStats::load().record_diff(&result).save();
 
     let t4 = Instant::now();
     let output = match opts.format {

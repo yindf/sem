@@ -1382,6 +1382,7 @@ dependencies = [
  "rusqlite",
  "sem-core",
  "sem-mcp",
+ "serde",
  "serde_json",
  "similar",
 ]

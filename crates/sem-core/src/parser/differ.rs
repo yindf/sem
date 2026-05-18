@@ -30,6 +30,8 @@ pub struct DiffResult {
     pub renamed_count: usize,
     pub reordered_count: usize,
     pub orphan_count: usize,
+    pub total_entities_before: usize,
+    pub total_entities_after: usize,
 }
 
 pub fn compute_semantic_diff(
@@ -39,7 +41,7 @@ pub fn compute_semantic_diff(
     author: Option<&str>,
 ) -> DiffResult {
     // Process files in parallel: each file's entity extraction and matching is independent
-    let per_file_changes: Vec<(String, Vec<SemanticChange>)> = maybe_par_iter!(file_changes)
+    let per_file_changes: Vec<(String, Vec<SemanticChange>, usize, usize)> = maybe_par_iter!(file_changes)
 
         .filter_map(|file| {
             let content_hint = file.after_content.as_deref()
@@ -74,6 +76,9 @@ pub fn compute_semantic_diff(
                 Vec::new()
             };
 
+            let before_count = before_entities.len();
+            let after_count = after_entities.len();
+
             let sim_fn = |a: &crate::model::entity::SemanticEntity,
                           b: &crate::model::entity::SemanticEntity|
              -> f64 { plugin.compute_similarity(a, b) };
@@ -106,16 +111,20 @@ pub fn compute_semantic_diff(
             if result.changes.is_empty() {
                 None
             } else {
-                Some((file.file_path.clone(), result.changes))
+                Some((file.file_path.clone(), result.changes, before_count, after_count))
             }
         })
         .collect();
 
     let mut all_changes: Vec<SemanticChange> = Vec::new();
     let mut files_with_changes: HashSet<String> = HashSet::new();
-    for (file_path, changes) in per_file_changes {
+    let mut total_entities_before: usize = 0;
+    let mut total_entities_after: usize = 0;
+    for (file_path, changes, before_count, after_count) in per_file_changes {
         files_with_changes.insert(file_path);
         all_changes.extend(changes);
+        total_entities_before += before_count;
+        total_entities_after += after_count;
     }
 
     // Single-pass counting (exclude orphan changes from entity counts)
@@ -152,6 +161,8 @@ pub fn compute_semantic_diff(
         renamed_count,
         reordered_count,
         orphan_count,
+        total_entities_before,
+        total_entities_after,
     }
 }
 

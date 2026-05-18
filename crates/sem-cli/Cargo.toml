@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 sem-core = { path = "../sem-core", version = "0.5.5" }
 sem-mcp = { path = "../sem-mcp", version = "0.5.5" }
+serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 colored = "2"
 similar = "2"

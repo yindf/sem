@@ -320,6 +320,26 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
         result.file_count,
     ));
 
+    // Show noise-filtered line when entities were analyzed
+    let entities_analyzed = result.total_entities_before.max(result.total_entities_after);
+    let changes_detected = result.added_count
+        + result.modified_count
+        + result.deleted_count
+        + result.moved_count
+        + result.renamed_count
+        + result.reordered_count;
+    if entities_analyzed > changes_detected {
+        let noise = entities_analyzed - changes_detected;
+        lines.push(
+            format!(
+                "Analyzed {} entities, {} unchanged filtered out",
+                entities_analyzed, noise
+            )
+            .dimmed()
+            .to_string(),
+        );
+    }
+
     // Warn if fallback chunking was used (unsupported file extension)
     let chunk_files: Vec<&str> = result
         .changes

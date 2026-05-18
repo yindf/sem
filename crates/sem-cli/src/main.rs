@@ -1,6 +1,7 @@
 mod cache;
 mod commands;
 mod formatters;
+mod stats;
 
 use clap::CommandFactory;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -263,6 +264,8 @@ enum Commands {
         #[arg(long, num_args = 1..)]
         file_exts: Vec<String>,
     },
+    /// Show lifetime diff statistics
+    Stats,
     /// Start the MCP server (stdin/stdout transport)
     Mcp,
     /// Replace `git diff` with `sem diff` globally
@@ -478,6 +481,9 @@ fn main() {
                 diff,
                 file_exts,
             });
+        }
+        Some(Commands::Stats) => {
+            commands::stats::run();
         }
         Some(Commands::Mcp) => {
             if let Err(e) = sem_mcp::run() {
