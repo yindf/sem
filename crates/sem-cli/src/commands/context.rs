@@ -2,7 +2,6 @@ use std::path::Path;
 
 use colored::Colorize;
 use sem_core::parser::context::build_context;
-use sem_core::parser::graph::EntityGraph;
 
 pub struct ContextOptions {
     pub cwd: String,
@@ -23,7 +22,7 @@ pub fn context_command(opts: ContextOptions) {
     let file_paths = super::graph::find_supported_files_public(root, &registry, &ext_filter);
     let (graph, all_entities) = super::graph::get_or_build_graph(root, &file_paths, &registry, opts.no_cache);
 
-    let entity = find_entity(&graph, &all_entities, opts.entity_name.as_deref(), opts.entity_id.as_deref(), opts.file_path.as_deref());
+    let entity = super::find_entity_in_graph(&graph, &all_entities, opts.entity_name.as_deref(), opts.entity_id.as_deref(), opts.file_path.as_deref(), "sem context");
     let entries = build_context(&graph, &entity.id, &all_entities, opts.budget);
 
     let total_tokens: usize = entries.iter().map(|e| e.estimated_tokens).sum();
@@ -83,105 +82,12 @@ pub fn context_command(opts: ContextOptions) {
     }
 }
 
-fn find_entity<'a>(
-    graph: &'a EntityGraph,
-    all_entities: &[sem_core::model::entity::SemanticEntity],
-    name: Option<&str>,
-    entity_id: Option<&str>,
-    file_hint: Option<&str>,
-) -> &'a sem_core::parser::graph::EntityInfo {
-    // Direct lookup by entity ID
-    if let Some(id) = entity_id {
-        if let Some(e) = graph.entities.get(id) {
-            return e;
-        }
-        eprintln!("{} Entity ID '{}' not found", "error:".red().bold(), id);
-        std::process::exit(1);
-    }
-
-    let name = name.unwrap_or_else(|| {
-        eprintln!("{} Either entity name or --entity-id is required", "error:".red().bold());
-        std::process::exit(1);
-    });
-
-    // Parse "Name(Signature)" syntax
-    let (query_name, query_signature) = if let Some(open) = name.rfind('(') {
-        if name.ends_with(')') && open > 0 {
-            (&name[..open], Some(&name[open..]))
-        } else {
-            (name, None)
-        }
-    } else {
-        (name, None)
-    };
-
-    // Find matching entities by name (and optionally signature)
-    let matching: Vec<&sem_core::model::entity::SemanticEntity> = if let Some(sig) = query_signature {
-        all_entities.iter().filter(|e| e.name == query_name && e.signature.as_deref() == Some(sig)).collect()
-    } else {
-        all_entities.iter().filter(|e| e.name == query_name).collect()
-    };
-
-    if matching.is_empty() {
-        eprintln!("{} Entity '{}' not found", "error:".red().bold(), name);
-        std::process::exit(1);
-    }
-
-    // Check for overloads when no signature specified
-    if query_signature.is_none() && matching.len() > 1 {
-        eprintln!(
-            "{} Entity '{}' has {} overloads:",
-            "error:".red().bold(),
-            query_name,
-            matching.len()
-        );
-        for e in &matching {
-            let sig = e.signature.as_deref().unwrap_or("n/a");
-            eprintln!(
-                "  {} {}{} (L{}:{})",
-                e.entity_type, e.name, sig, e.start_line, e.end_line
-            );
-        }
-        let example_sig = matching[0]
-            .signature
-            .as_deref()
-            .unwrap_or("()");
-        eprintln!(
-            "\nSpecify the signature to disambiguate: sem context \"{}{}\"",
-            query_name, example_sig
-        );
-        std::process::exit(1);
-    }
-
-    // Filter by file hint
-    let target = if let Some(file) = file_hint {
-        matching.iter().find(|e| e.file_path == file).copied().unwrap_or(matching[0])
-    } else {
-        matching[0]
-    };
-
-    // Look up in graph by entity ID
-    if let Some(e) = graph.entities.get(&target.id) {
-        return e;
-    }
-
-    // Fallback: match by name in graph (old behavior)
-    let mut graph_matching: Vec<_> = graph.entities.values().filter(|e| e.name == query_name).collect();
-    if let Some(file) = file_hint {
-        if let Some(e) = graph_matching.iter().find(|e| e.file_path == file) {
-            return e;
-        }
-    }
-    graph_matching.sort_by_key(|e| (&e.file_path, e.start_line));
-    graph_matching[0]
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use sem_core::model::entity::SemanticEntity;
-    use sem_core::parser::graph::EntityInfo;
+    use sem_core::parser::graph::{EntityGraph, EntityInfo};
     use std::collections::HashMap;
+    use super::super::find_entity_in_graph;
 
     fn make_entity(name: &str, signature: Option<&str>, line: usize) -> SemanticEntity {
         let sig_str = signature.unwrap_or("");
@@ -224,7 +130,7 @@ mod tests {
         ];
         let (graph, all) = build_graph(&entities);
 
-        let result = find_entity(&graph, &all, Some("Process(int)"), None, None);
+        let result = find_entity_in_graph(&graph, &all, Some("Process(int)"), None, None, "sem context");
         assert_eq!(result.id, "svc.cs::method::Process(int)");
         assert_eq!(result.start_line, 10);
     }
@@ -237,7 +143,7 @@ mod tests {
         ];
         let (graph, all) = build_graph(&entities);
 
-        let result = find_entity(&graph, &all, Some("Process(string)"), None, None);
+        let result = find_entity_in_graph(&graph, &all, Some("Process(string)"), None, None, "sem context");
         assert_eq!(result.id, "svc.cs::method::Process(string)");
         assert_eq!(result.start_line, 30);
     }
@@ -249,7 +155,7 @@ mod tests {
         ];
         let (graph, all) = build_graph(&entities);
 
-        let result = find_entity(&graph, &all, Some("Handle"), None, None);
+        let result = find_entity_in_graph(&graph, &all, Some("Handle"), None, None, "sem context");
         assert_eq!(result.name, "Handle");
     }
 
@@ -261,7 +167,7 @@ mod tests {
         ];
         let (graph, all) = build_graph(&entities);
 
-        let result = find_entity(&graph, &all, None, Some("svc.cs::method::Process(string)"), None);
+        let result = find_entity_in_graph(&graph, &all, None, Some("svc.cs::method::Process(string)"), None, "sem context");
         assert_eq!(result.id, "svc.cs::method::Process(string)");
     }
 
@@ -273,7 +179,7 @@ mod tests {
         ];
         let (graph, all) = build_graph(&entities);
 
-        let result = find_entity(&graph, &all, Some("Process"), None, None);
+        let result = find_entity_in_graph(&graph, &all, Some("Process"), None, None, "sem context");
         assert_eq!(result.id, "svc.cs::method::Process(int)");
     }
 
@@ -285,7 +191,7 @@ mod tests {
         ];
         let (graph, all) = build_graph(&entities);
 
-        let result = find_entity(&graph, &all, Some("ResumeAllDown()"), None, None);
+        let result = find_entity_in_graph(&graph, &all, Some("ResumeAllDown()"), None, None, "sem context");
         assert_eq!(result.id, "svc.cs::method::ResumeAllDown()");
         assert_eq!(result.start_line, 199);
     }
@@ -298,7 +204,7 @@ mod tests {
         ];
         let (graph, all) = build_graph(&entities);
 
-        let result = find_entity(&graph, &all, Some("ResumeAllDown(bool)"), None, None);
+        let result = find_entity_in_graph(&graph, &all, Some("ResumeAllDown(bool)"), None, None, "sem context");
         assert_eq!(result.id, "svc.cs::method::ResumeAllDown(bool)");
         assert_eq!(result.start_line, 467);
     }

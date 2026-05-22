@@ -8,6 +8,9 @@ pub mod log;
 pub mod setup;
 pub mod verify;
 
+use colored::Colorize;
+use sem_core::model::entity::SemanticEntity;
+use sem_core::parser::graph::EntityGraph;
 use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::registry::ParserRegistry;
 use std::path::Path;
@@ -20,6 +23,108 @@ pub fn create_registry(cwd: &str) -> ParserRegistry {
     registry.load_semrc(root);
     registry.load_gitattributes(root);
     registry
+}
+
+/// Parsed entity query: "Name" or "Name(Signature)".
+pub struct EntityQuery {
+    pub name: String,
+    pub signature: Option<String>,
+}
+
+pub fn parse_entity_query(input: &str) -> EntityQuery {
+    if let Some(open) = input.rfind('(') {
+        if input.ends_with(')') && open > 0 {
+            return EntityQuery {
+                name: input[..open].to_string(),
+                signature: Some(input[open..].to_string()),
+            };
+        }
+    }
+    EntityQuery {
+        name: input.to_string(),
+        signature: None,
+    }
+}
+
+/// Find an entity in the graph by name, ID, or name+signature.
+/// Handles overload disambiguation with clear error messages.
+pub fn find_entity_in_graph<'a>(
+    graph: &'a EntityGraph,
+    all_entities: &[SemanticEntity],
+    name: Option<&str>,
+    entity_id: Option<&str>,
+    file_hint: Option<&str>,
+    command_name: &str,
+) -> &'a sem_core::parser::graph::EntityInfo {
+    if let Some(id) = entity_id {
+        if let Some(e) = graph.entities.get(id) {
+            return e;
+        }
+        eprintln!("{} Entity ID '{}' not found", "error:".red().bold(), id);
+        std::process::exit(1);
+    }
+
+    let name = name.unwrap_or_else(|| {
+        eprintln!("{} Either entity name or --entity-id is required", "error:".red().bold());
+        std::process::exit(1);
+    });
+
+    let query = parse_entity_query(name);
+
+    let matching: Vec<&SemanticEntity> = if let Some(sig) = &query.signature {
+        all_entities.iter().filter(|e| e.name == query.name && e.signature.as_deref() == Some(sig.as_str())).collect()
+    } else {
+        all_entities.iter().filter(|e| e.name == query.name).collect()
+    };
+
+    if matching.is_empty() {
+        eprintln!("{} Entity '{}' not found", "error:".red().bold(), name);
+        std::process::exit(1);
+    }
+
+    if query.signature.is_none() && matching.len() > 1 {
+        eprintln!(
+            "{} Entity '{}' has {} overloads:",
+            "error:".red().bold(),
+            query.name,
+            matching.len()
+        );
+        for e in &matching {
+            let sig = e.signature.as_deref().unwrap_or("n/a");
+            eprintln!(
+                "  {} {}{} (L{}:{})",
+                e.entity_type, e.name, sig, e.start_line, e.end_line
+            );
+        }
+        let example_sig = matching[0]
+            .signature
+            .as_deref()
+            .unwrap_or("()");
+        eprintln!(
+            "\nSpecify the signature to disambiguate: {} \"{}{}\"",
+            command_name, query.name, example_sig
+        );
+        std::process::exit(1);
+    }
+
+    let target = if let Some(file) = file_hint {
+        matching.iter().find(|e| e.file_path == file).copied().unwrap_or(matching[0])
+    } else {
+        matching[0]
+    };
+
+    if let Some(e) = graph.entities.get(&target.id) {
+        return e;
+    }
+
+    let mut graph_matching: Vec<_> = graph.entities.values().filter(|e| e.name == query.name).collect();
+    if let Some(file) = file_hint {
+        if let Some(e) = graph_matching.iter().find(|e| e.file_path == file) {
+            return e;
+        }
+    }
+    graph_matching.sort_by_key(|e| (&e.file_path, e.start_line));
+    graph_matching[0]
 }
 
 /// Truncate a string to `max_chars` Unicode scalar values (codepoints), appending "..." if

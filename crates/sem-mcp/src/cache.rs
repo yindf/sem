@@ -64,7 +64,8 @@ impl DiskCache {
                  content_hash TEXT NOT NULL,
                  structural_hash TEXT,
                  parent_id TEXT,
-                 metadata_json TEXT
+                 metadata_json TEXT,
+                 signature TEXT
              );
              CREATE TABLE IF NOT EXISTS edges (
                  from_entity TEXT NOT NULL,
@@ -72,6 +73,9 @@ impl DiskCache {
                  ref_type TEXT NOT NULL
              );",
         )?;
+
+        // Migration: add signature column if missing (existing databases)
+        conn.execute_batch("ALTER TABLE entities ADD COLUMN signature TEXT").ok();
 
         Ok(Self { conn })
     }
@@ -107,7 +111,7 @@ impl DiskCache {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?;
             for e in entities {
                 let metadata_json = e
@@ -126,6 +130,7 @@ impl DiskCache {
                     e.structural_hash,
                     e.parent_id,
                     metadata_json,
+                    e.signature,
                 ])?;
             }
         }
@@ -187,7 +192,7 @@ impl DiskCache {
         // Load entities
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, signature FROM entities")
             .ok()?;
         let entities: Vec<SemanticEntity> = entity_stmt
             .query_map([], |row| {
@@ -205,7 +210,7 @@ impl DiskCache {
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
                     metadata,
-                    signature: None,
+                    signature: row.get(11)?,
                 })
             })
             .ok()?
@@ -331,7 +336,7 @@ impl DiskCache {
         // Load ALL entities, split into clean vs stale-file
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, signature FROM entities")
             .ok()?;
         let all_cached: Vec<SemanticEntity> = entity_stmt
             .query_map([], |row| {
@@ -349,7 +354,7 @@ impl DiskCache {
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
                     metadata,
-                    signature: None,
+                    signature: row.get(11)?,
                 })
             })
             .ok()?
@@ -463,7 +468,7 @@ impl DiskCache {
 
         {
             let mut ins = tx.prepare(
-                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?;
             for e in entities {
                 if stale_set.contains(e.file_path.as_str()) {
@@ -483,6 +488,7 @@ impl DiskCache {
                         e.structural_hash,
                         e.parent_id,
                         metadata_json,
+                        e.signature,
                     ])?;
                 }
             }

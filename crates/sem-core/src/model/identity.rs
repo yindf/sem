@@ -530,6 +530,19 @@ fn overload_similarity(a: &SemanticEntity, b: &SemanticEntity) -> f64 {
     default_similarity(a, b)
 }
 
+/// Jaccard token similarity between two strings.
+/// Splits both strings on whitespace, computes |intersection| / |union|.
+pub fn jaccard_str_similarity(a: &str, b: &str) -> f64 {
+    let set_a: HashSet<&str> = a.split_whitespace().collect();
+    let set_b: HashSet<&str> = b.split_whitespace().collect();
+    if set_a.is_empty() && set_b.is_empty() {
+        return 1.0;
+    }
+    let intersection = set_a.intersection(&set_b).count();
+    let union = set_a.union(&set_b).count();
+    intersection as f64 / union as f64
+}
+
 /// Default content similarity using Jaccard index on whitespace-split tokens
 pub fn default_similarity(a: &SemanticEntity, b: &SemanticEntity) -> f64 {
     let tokens_a: Vec<&str> = a.content.split_whitespace().collect();
@@ -545,17 +558,7 @@ pub fn default_similarity(a: &SemanticEntity, b: &SemanticEntity) -> f64 {
         return 0.0;
     }
 
-    let set_a: HashSet<&str> = tokens_a.into_iter().collect();
-    let set_b: HashSet<&str> = tokens_b.into_iter().collect();
-
-    let intersection_size = set_a.intersection(&set_b).count();
-    let union_size = set_a.union(&set_b).count();
-
-    if union_size == 0 {
-        return 0.0;
-    }
-
-    intersection_size as f64 / union_size as f64
+    jaccard_str_similarity(&a.content, &b.content)
 }
 
 /// Detect intra-file reordering of unchanged entities.

@@ -7,27 +7,7 @@ use sem_core::model::entity::SemanticEntity;
 use sem_core::parser::registry::ParserRegistry;
 
 use super::truncate_str;
-
-/// Parsed entity query: "Name" or "Name(Signature)".
-struct EntityQuery {
-    name: String,
-    signature: Option<String>,
-}
-
-fn parse_entity_query(input: &str) -> EntityQuery {
-    if let Some(open) = input.rfind('(') {
-        if input.ends_with(')') && open > 0 {
-            return EntityQuery {
-                name: input[..open].to_string(),
-                signature: Some(input[open..].to_string()),
-            };
-        }
-    }
-    EntityQuery {
-        name: input.to_string(),
-        signature: None,
-    }
-}
+use super::{EntityQuery, parse_entity_query};
 
 pub struct LogOptions {
     pub cwd: String,
@@ -96,7 +76,7 @@ struct LogEntry {
 pub fn log_command(opts: LogOptions) {
     let root = Path::new(&opts.cwd);
     let registry = super::create_registry(&opts.cwd);
-    let mut query = parse_entity_query(&opts.entity_name);
+    let query = parse_entity_query(&opts.entity_name);
 
     let bridge = match GitBridge::open(root) {
         Ok(b) => b,
@@ -159,7 +139,6 @@ pub fn log_command(opts: LogOptions) {
         std::process::exit(1);
     }
 
-    // Check for overloads when no signature specified
     if query.signature.is_none() {
         let check_entities = registry.extract_entities(&file_path, &file_content_hint);
         let overloads: Vec<&SemanticEntity> = check_entities
@@ -331,7 +310,7 @@ pub fn log_command(opts: LogOptions) {
                                 .filter(|e| e.name != query.name && e.entity_type == ent.entity_type)
                                 .filter(|e| e.signature == ent.signature)
                                 .filter_map(|e| {
-                                    let score = jaccard_similarity(&ent.content, &e.content);
+                                    let score = sem_core::model::identity::jaccard_str_similarity(&ent.content, &e.content);
                                     if score >= 0.7 { Some((e, score)) } else { None }
                                 })
                                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -675,7 +654,7 @@ pub fn log_command(opts: LogOptions) {
             }
             if !moved {
                 // No more file moves — prepend final chunk and stop
-                let mut prepend = std::mem::take(&mut chunk);
+                let prepend = std::mem::take(&mut chunk);
                 entries.splice(0..0, prepend);
                 break;
             }
@@ -961,18 +940,6 @@ struct MatchedEntity {
     old_signature: Option<String>,
 }
 
-/// Compute Jaccard token similarity between two strings.
-fn jaccard_similarity(a: &str, b: &str) -> f64 {
-    let set_a: std::collections::BTreeSet<&str> = a.split_whitespace().collect();
-    let set_b: std::collections::BTreeSet<&str> = b.split_whitespace().collect();
-    if set_a.is_empty() && set_b.is_empty() {
-        return 1.0;
-    }
-    let intersection = set_a.intersection(&set_b).count();
-    let union = set_a.union(&set_b).count();
-    intersection as f64 / union as f64
-}
-
 /// Multi-strategy entity finder that handles overloads, signature changes, and renames.
 ///
 /// Priority:
@@ -1090,7 +1057,7 @@ fn find_entity_in_commit(
         if let Some(prev_content) = prev_entity_content {
             let best = sig_candidates
                 .iter()
-                .map(|e| (e, jaccard_similarity(prev_content, &e.content)))
+                .map(|e| (e, sem_core::model::identity::jaccard_str_similarity(prev_content, &e.content)))
                 .filter(|(_, score)| *score >= 0.5)
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -1144,7 +1111,7 @@ fn find_entity_in_commit(
         if !rename_candidates.is_empty() {
             let best = rename_candidates
                 .iter()
-                .map(|e| (e, jaccard_similarity(prev_content, &e.content)))
+                .map(|e| (e, sem_core::model::identity::jaccard_str_similarity(prev_content, &e.content)))
                 .filter(|(_, score)| *score >= 0.5)
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -1193,7 +1160,6 @@ fn find_predecessor<'a>(
         }
     }
 
-    // Fallback: first candidate
     candidates.into_iter().next()
 }
 
@@ -1216,71 +1182,54 @@ fn search_entity_cross_file_v2(
     read_from_parent: bool,
 ) -> Option<(String, SemanticEntity, EntityChangeType, Option<String>, Option<String>)> {
     let changed_files = bridge.get_commit_changed_files(sha).ok()?;
-    // Normalize exclude_file to forward slashes for consistent comparison
     let exclude_normalized = exclude_file.replace('\\', "/");
-    // Pre-compute parent SHA for reading deleted files
     let parent_sha = bridge.get_parent_sha(sha).ok().flatten();
 
-    // Helper: read file content from the appropriate commit
-    let read_file = |file_path: &str| -> Option<String> {
-        if read_from_parent {
-            // Read from parent commit (before this commit's changes)
-            if let Some(ref psha) = parent_sha {
-                if let Ok(Some(c)) = bridge.read_file_at_ref(psha, file_path) {
-                    return Some(c);
-                }
-            }
-            // Fallback for root commits
-            if let Ok(Some(c)) = bridge.read_file_at_ref(sha, file_path) {
-                return Some(c);
-            }
-        } else {
-            // Read from current commit
-            if let Ok(Some(c)) = bridge.read_file_at_ref(sha, file_path) {
-                return Some(c);
-            }
-            // File may have been deleted — try parent
-            if let Some(ref psha) = parent_sha {
-                if let Ok(Some(c)) = bridge.read_file_at_ref(psha, file_path) {
-                    return Some(c);
-                }
-            }
-        }
-        None
-    };
-
-    // Pass 1: Exact (name, signature) in other files → Moved
+    let mut entity_cache: HashMap<String, Vec<SemanticEntity>> = HashMap::new();
     for file_path in &changed_files {
         if file_path == &exclude_normalized {
             continue;
         }
-        let content = match read_file(file_path) {
-            Some(c) => c,
-            None => continue,
-        };
-        let entities = registry.extract_entities(file_path, &content);
-        let found = if let Some(sig) = query_signature {
-            entities.into_iter().find(|e| e.name == query_name && e.signature.as_deref() == Some(sig))
+        let content = if read_from_parent {
+            if let Some(ref psha) = parent_sha {
+                if let Ok(Some(c)) = bridge.read_file_at_ref(psha, file_path) {
+                    Some(c)
+                } else {
+                    bridge.read_file_at_ref(sha, file_path).ok().flatten()
+                }
+            } else {
+                bridge.read_file_at_ref(sha, file_path).ok().flatten()
+            }
         } else {
-            entities.into_iter().find(|e| e.name == query_name)
+            if let Ok(Some(c)) = bridge.read_file_at_ref(sha, file_path) {
+                Some(c)
+            } else if let Some(ref psha) = parent_sha {
+                bridge.read_file_at_ref(psha, file_path).ok().flatten()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = content {
+            entity_cache.insert(file_path.clone(), registry.extract_entities(file_path, &c));
+        }
+    }
+
+    // Pass 1: Exact (name, signature) in other files → Moved
+    for (file_path, entities) in &entity_cache {
+        let found = if let Some(sig) = query_signature {
+            entities.iter().find(|e| e.name == query_name && e.signature.as_deref() == Some(sig))
+        } else {
+            entities.iter().find(|e| e.name == query_name)
         };
         if let Some(ent) = found {
-            return Some((file_path.clone(), ent, EntityChangeType::Moved, None, None));
+            return Some((file_path.clone(), ent.clone(), EntityChangeType::Moved, None, None));
         }
     }
 
     // Pass 2: Same name, different signature + content/structure match → Moved + SignatureChanged
     if prev_content_hash.is_some() || prev_structural_hash.is_some() {
-        for file_path in &changed_files {
-            if file_path == &exclude_normalized {
-                continue;
-            }
-            let content = match read_file(file_path) {
-                Some(c) => c,
-                None => continue,
-            };
-            let entities = registry.extract_entities(file_path, &content);
-            for ent in &entities {
+        for (file_path, entities) in &entity_cache {
+            for ent in entities {
                 if ent.name != query_name {
                     continue;
                 }
@@ -1303,16 +1252,8 @@ fn search_entity_cross_file_v2(
 
     // Pass 3: Different name + content/structure match → Moved + Renamed
     if prev_content_hash.is_some() || prev_structural_hash.is_some() {
-        for file_path in &changed_files {
-            if file_path == &exclude_normalized {
-                continue;
-            }
-            let content = match read_file(file_path) {
-                Some(c) => c,
-                None => continue,
-            };
-            let entities = registry.extract_entities(file_path, &content);
-            for ent in &entities {
+        for (file_path, entities) in &entity_cache {
+            for ent in entities {
                 if ent.name == query_name {
                     continue;
                 }
@@ -2083,19 +2024,19 @@ mod tests {
         assert!(result.is_none(), "should not rename-match with different signatures");
     }
 
-    // --- jaccard_similarity tests ---
+    // --- sem_core::model::identity::jaccard_str_similarity tests ---
 
     #[test]
     fn test_jaccard_identical_content() {
         let content = "public void Foo(int x)\n{\n    return x;\n}";
-        assert_eq!(jaccard_similarity(content, content), 1.0);
+        assert_eq!(sem_core::model::identity::jaccard_str_similarity(content, content), 1.0);
     }
 
     #[test]
     fn test_jaccard_rename_high_similarity() {
         let old = "public int GetDownPackageCount(bool a, bool b, bool c, int d)\n{\n    return 1;\n}";
         let new = "public int GetDownPackageCountXXX(bool a, bool b, bool c, int d)\n{\n    return 1;\n}";
-        let score = jaccard_similarity(old, new);
+        let score = sem_core::model::identity::jaccard_str_similarity(old, new);
         assert!(score >= 0.7, "rename should have high Jaccard similarity, got {score}");
     }
 
@@ -2103,7 +2044,7 @@ mod tests {
     fn test_jaccard_different_methods_lower_similarity() {
         let a = "public void RegisterUpdateInterruptHandler(Action<GainInterruptReason> func)\n{\n    UpdateInterruptHandler += func;\n}";
         let b = "public void RegisterDialogValidHandler(Func<int, bool> func)\n{\n    DialogValidHandler += func;\n}";
-        let score = jaccard_similarity(a, b);
+        let score = sem_core::model::identity::jaccard_str_similarity(a, b);
         // These have similar structure but different names/signatures
         // Score should be moderate, but with signature filter it won't matter
         assert!(score < 0.9, "different methods should have lower Jaccard, got {score}");
