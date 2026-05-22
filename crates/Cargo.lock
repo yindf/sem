@@ -1337,6 +1337,7 @@ dependencies = [
  "sem-mcp",
  "serde_json",
  "similar",
+ "tempfile",
 ]
 
 [[package]]

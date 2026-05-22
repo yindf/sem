@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use git2::{Blame, Delta, Diff, DiffOptions, ErrorCode, Oid, Repository};
+use git2::{Blame, Delta, Diff, DiffFindOptions, DiffOptions, ErrorCode, Oid, Repository};
 use thiserror::Error;
 
 use super::types::{CommitInfo, DiffScope, FileChange, FileStatus};
@@ -444,6 +444,121 @@ impl GitBridge {
         }
 
         Ok(commits)
+    }
+
+    /// Get the first parent SHA of a commit, if it has one.
+    pub fn get_parent_sha(&self, sha: &str) -> Result<Option<String>, GitError> {
+        let obj = self.repo.revparse_single(sha)?;
+        let commit = obj.peel_to_commit()?;
+        if commit.parent_count() > 0 {
+            Ok(Some(commit.parent(0)?.id().to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get commits that modified a specific file, walking history from a
+    /// given commit SHA backward. Same logic as `get_file_commits` but
+    /// starts the revwalk from the given commit's first parent instead of HEAD.
+    /// This is needed after following a rename: the old path exists in older
+    /// commits but not at HEAD, so a HEAD-based revwalk would miss them.
+    /// Returns commits in reverse chronological order (newest first).
+    pub fn get_file_commits_from(
+        &self,
+        file_path: &str,
+        from_sha: &str,
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, GitError> {
+        let start_commit = self.repo.revparse_single(from_sha)?.peel_to_commit()?;
+        // Start from the parent of the rename commit — the file existed at the
+        // old path in the parent's tree.
+        let start_oid = if start_commit.parent_count() > 0 {
+            start_commit.parent(0)?.id()
+        } else {
+            start_commit.id()
+        };
+
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.push(start_oid)?;
+        revwalk.set_sorting(git2::Sort::TIME)?;
+
+        let mut commits = Vec::new();
+        let path = Path::new(file_path);
+
+        for oid_result in revwalk {
+            let oid = oid_result?;
+            let commit = self.repo.find_commit(oid)?;
+            let tree = commit.tree()?;
+
+            let file_in_commit = tree.get_path(path).ok().map(|e| e.id());
+
+            let file_in_parent = if commit.parent_count() > 0 {
+                commit.parent(0)
+                    .ok()
+                    .and_then(|p| p.tree().ok())
+                    .and_then(|t| t.get_path(path).ok().map(|e| e.id()))
+            } else {
+                None
+            };
+
+            let changed = match (file_in_commit, file_in_parent) {
+                (Some(cur), Some(prev)) => cur != prev,
+                (Some(_), None) => true,
+                (None, Some(_)) => true,
+                (None, None) => false,
+            };
+
+            if changed {
+                let sha = oid.to_string();
+                commits.push(CommitInfo {
+                    short_sha: sha[..7.min(sha.len())].to_string(),
+                    sha,
+                    author: commit.author().name().unwrap_or("unknown").to_string(),
+                    date: commit.time().seconds().to_string(),
+                    message: commit.message().unwrap_or("").to_string(),
+                });
+
+                if commits.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        Ok(commits)
+    }
+
+    /// If `file_path` was renamed in commit `sha`, return the old path.
+    /// Uses git's rename detection (equivalent to `git log --follow`).
+    pub fn get_rename_source(&self, sha: &str, file_path: &str) -> Result<Option<String>, GitError> {
+        let obj = self.repo.revparse_single(sha)?;
+        let commit = obj.peel_to_commit()?;
+        let tree = commit.tree()?;
+        let parent_tree = if commit.parent_count() > 0 {
+            Some(commit.parent(0)?.tree()?)
+        } else {
+            None
+        };
+
+        let mut diff = self.repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        let mut find_opts = DiffFindOptions::new();
+        find_opts.rename_threshold(100);
+        diff.find_similar(Some(&mut find_opts))?;
+
+        // Normalize file_path to forward slashes (git always uses /)
+        let normalized = file_path.replace('\\', "/");
+
+        for delta in diff.deltas() {
+            if delta.status() == Delta::Renamed {
+                if let Some(new_p) = delta.new_file().path().and_then(|p| p.to_str()) {
+                    if new_p == normalized {
+                        if let Some(old_p) = delta.old_file().path().and_then(|p| p.to_str()) {
+                            return Ok(Some(old_p.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Get all file paths changed in a single commit (vs its parent).

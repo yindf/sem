@@ -195,7 +195,10 @@ pub fn log_command(opts: LogOptions) {
 
     // Walk commits, tracking entity across file moves
     let mut current_git_file = git_file_path.clone();
+    let mut visited_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited_files.insert(current_git_file.replace('\\', "/"));
     let mut entries: Vec<LogEntry> = Vec::new();
+    let mut chunk: Vec<LogEntry> = Vec::new();
     let mut prev_entity_content: Option<String> = None;
     let mut prev_structural_hash: Option<String> = None;
     let mut prev_content_hash: Option<String> = None;
@@ -205,12 +208,26 @@ pub fn log_command(opts: LogOptions) {
     let mut found_at_least_once = false;
     let mut total_commits = 0usize;
     let mut skip_until_sha: Option<String> = None;
+    let mut following_rename = false; // true when walking an old path from a rename
     // Prepend entries from a rename predecessor walk (filled after main walk)
     let mut prepend_entries: Option<(Vec<LogEntry>, usize, String)> = None; // (entries, commits, predecessor_name)
 
     loop {
         // --scan-limit controls how many file-changing commits to scan.
-        let commits = match bridge.get_file_commits(&current_git_file, opts.scan_limit) {
+        // When following a rename chain, use diff-based commit detection
+        // (the old path may not exist at HEAD).
+        let commits = if following_rename {
+            if let Some(sha) = skip_until_sha.take() {
+                // Walk from the rename commit's parent — skip_until_sha is handled
+                // by starting the revwalk at the right point, not by skipping.
+                bridge.get_file_commits_from(&current_git_file, &sha, opts.scan_limit)
+            } else {
+                bridge.get_file_commits(&current_git_file, opts.scan_limit)
+            }
+        } else {
+            bridge.get_file_commits(&current_git_file, opts.scan_limit)
+        };
+        let commits = match commits {
             Ok(c) => c,
             Err(e) => {
                 if total_commits == 0 {
@@ -271,6 +288,7 @@ pub fn log_command(opts: LogOptions) {
             match found_match {
                 Some(m) => {
                     let ent = m.entity;
+
                     if !found_at_least_once {
                         entity_type = ent.entity_type.clone();
                     }
@@ -280,7 +298,7 @@ pub fn log_command(opts: LogOptions) {
 
                     if !found_at_least_once {
                         found_at_least_once = true;
-                        entries.push(LogEntry {
+                        chunk.push(LogEntry {
                             short_sha: commit.short_sha.clone(),
                             author: commit.author.clone(),
                             date,
@@ -334,8 +352,56 @@ pub fn log_command(opts: LogOptions) {
                                 prepend_entries = Some((pred_ents, pred_commits, pred_name));
                             }
                         }
+
+                        // Cross-file lookback: if no same-file predecessor was found,
+                        // check if this entity was moved from another file in this commit
+                        // (e.g., during a "Split Large CS Files" refactoring).
+                        if prepend_entries.is_none() {
+                            let cross = search_entity_cross_file_v2(
+                                &bridge,
+                                &registry,
+                                &commit.sha,
+                                &ent.name,
+                                ent.signature.as_deref(),
+                                Some(ent.content_hash.as_str()),
+                                ent.structural_hash.as_deref(),
+                                &ent.name,
+                                ent.signature.as_deref(),
+                                &current_git_file,
+                                true, // read from parent — find where entity came FROM
+                            );
+
+                            if let Some((source_file, source_ent, _, old_name, old_signature)) = cross {
+                                if !visited_files.contains(&source_file.replace('\\', "/")) {
+                                    // Modify the first entry from "added" to "moved"
+                                    if let Some(first) = chunk.first_mut() {
+                                        first.change_type = EntityChangeType::Moved;
+                                        first.prev_file_path = Some(source_file.clone());
+                                        first.prev_content = Some(source_ent.content.clone());
+                                        first.old_name = old_name;
+                                        first.old_signature = old_signature;
+                                    }
+
+                                    visited_files.insert(source_file.replace('\\', "/"));
+
+                                    // Walk the source file's history separately.
+                                    // We can't use the main loop's skip_until_sha mechanism
+                                    // because it processes commits in the wrong direction
+                                    // (it skips older commits and processes newer ones).
+                                    let (pred_ents, pred_commits) = walk_predecessor(
+                                        &bridge,
+                                        &registry,
+                                        &source_file,
+                                        &source_ent,
+                                        &ent,
+                                        opts.scan_limit,
+                                    );
+                                    prepend_entries = Some((pred_ents, pred_commits, source_ent.name.clone()));
+                                }
+                            }
+                        }
                     } else if prev_entity_content.is_none() {
-                        entries.push(LogEntry {
+                        chunk.push(LogEntry {
                             short_sha: commit.short_sha.clone(),
                             author: commit.author.clone(),
                             date,
@@ -350,6 +416,38 @@ pub fn log_command(opts: LogOptions) {
                         });
                     } else {
                         // Determine change type
+
+                        // Before accepting rename/signature-change, verify the entity
+                        // actually changed at this commit (vs its git parent).
+                        // If the entity exists unchanged in the parent, this commit
+                        // didn't modify it — skip.
+                        if let Some(EntityChangeType::Renamed | EntityChangeType::SignatureChanged) = m.match_type {
+                            if let Ok(Some(parent_sha)) = bridge.get_parent_sha(&commit.sha) {
+                                let parent_file = bridge
+                                    .read_file_at_ref(&parent_sha, &current_git_file)
+                                    .ok()
+                                    .flatten();
+                                let parent_entities: Vec<SemanticEntity> = parent_file
+                                    .as_ref()
+                                    .map(|c| registry.extract_entities(&current_git_file, c))
+                                    .unwrap_or_default();
+
+                                let unchanged_in_parent = parent_entities.iter().any(|pe| {
+                                    pe.name == ent.name
+                                        && pe.signature == ent.signature
+                                        && pe.content_hash == ent.content_hash
+                                });
+                                if unchanged_in_parent {
+                                    prev_entity_content = Some(ent.content.clone());
+                                    prev_structural_hash = ent.structural_hash.clone();
+                                    prev_content_hash = Some(ent.content_hash.clone());
+                                    prev_entity_name = ent.name.clone();
+                                    prev_entity_signature = ent.signature.clone();
+                                    continue;
+                                }
+                            }
+                        }
+
                         let change_type = if let Some(mt) = m.match_type {
                             mt
                         } else {
@@ -379,7 +477,7 @@ pub fn log_command(opts: LogOptions) {
                             }
                         };
 
-                        entries.push(LogEntry {
+                        chunk.push(LogEntry {
                             short_sha: commit.short_sha.clone(),
                             author: commit.author.clone(),
                             date,
@@ -415,12 +513,15 @@ pub fn log_command(opts: LogOptions) {
                             &prev_entity_name,
                             prev_entity_signature.as_deref(),
                             &current_git_file,
+                            false, // read from current commit — find where entity moved TO
                         );
 
                         match cross {
-                            Some((new_file, ent, change_type, old_name, old_signature)) => {
+                            Some((new_file, ent, change_type, old_name, old_signature))
+                                if !visited_files.contains(&new_file.replace('\\', "/")) =>
+                            {
                                 let prev_file = current_git_file.clone();
-                                entries.push(LogEntry {
+                                chunk.push(LogEntry {
                                     short_sha: commit.short_sha.clone(),
                                     author: commit.author.clone(),
                                     date,
@@ -434,6 +535,7 @@ pub fn log_command(opts: LogOptions) {
                                     old_signature,
                                 });
 
+                                visited_files.insert(new_file.replace('\\', "/"));
                                 prev_entity_content = Some(ent.content.clone());
                                 prev_structural_hash = ent.structural_hash.clone();
                                 prev_content_hash = Some(ent.content_hash.clone());
@@ -444,8 +546,11 @@ pub fn log_command(opts: LogOptions) {
                                 moved = true;
                                 break;
                             }
+                            Some(_) => {
+                                // Cross-file match found but target already visited — skip
+                            }
                             None => {
-                                entries.push(LogEntry {
+                                chunk.push(LogEntry {
                                     short_sha: commit.short_sha.clone(),
                                     author: commit.author.clone(),
                                     date,
@@ -470,7 +575,7 @@ pub fn log_command(opts: LogOptions) {
                         if let Some(pred) = find_predecessor(&commit_entities, &query.name, query.signature.as_deref()) {
                             found_at_least_once = true;
                             entity_type = pred.entity_type.clone();
-                            entries.push(LogEntry {
+                            chunk.push(LogEntry {
                                 short_sha: commit.short_sha.clone(),
                                 author: commit.author.clone(),
                                 date,
@@ -495,8 +600,89 @@ pub fn log_command(opts: LogOptions) {
         }
 
         if !moved {
-            break;
+            // No semantic cross-file entity move detected.
+            // Check if the file itself was renamed — if so, follow the old path
+            // (like git log --follow).
+            if found_at_least_once {
+                if let Some(oldest_commit) = reversed.first() {
+                    if let Ok(Some(old_path)) = bridge.get_rename_source(&oldest_commit.sha, &current_git_file) {
+                        let normalized_old = old_path.replace('\\', "/");
+                        if normalized_old != current_git_file.replace('\\', "/")
+                            && !visited_files.contains(&normalized_old)
+                        {
+                            // Remove the duplicate "added" entry from the same commit
+                            // if the entity was actually moved here from the old path.
+                            if let Some(last) = chunk.last() {
+                                if last.short_sha == oldest_commit.short_sha
+                                    && matches!(last.change_type, EntityChangeType::Added)
+                                {
+                                    chunk.pop();
+                                }
+                            }
+
+                            // Emit a Moved entry for the rename commit
+                            let new_path = current_git_file.clone();
+                            let date = chrono_lite_format(oldest_commit.date.parse::<i64>().unwrap_or(0));
+                            let msg_first_line = oldest_commit.message.lines().next().unwrap_or("").to_string();
+
+                            // Read entity content from old path at the rename commit's parent
+                            // (the entity existed there before the rename)
+                            let old_content = match bridge.get_parent_sha(&oldest_commit.sha) {
+                                Ok(Some(parent_sha)) => {
+                                    bridge.read_file_at_ref(&parent_sha, &old_path).ok().flatten()
+                                }
+                                _ => None,
+                            };
+                            let old_entities: Vec<SemanticEntity> = old_content
+                                .as_ref()
+                                .map(|c| registry.extract_entities(&old_path, c))
+                                .unwrap_or_default();
+                            let old_ent = old_entities.iter().find(|e| {
+                                e.name == prev_entity_name && e.signature == prev_entity_signature
+                            });
+
+                            chunk.push(LogEntry {
+                                short_sha: oldest_commit.short_sha.clone(),
+                                author: oldest_commit.author.clone(),
+                                date,
+                                message: msg_first_line,
+                                change_type: EntityChangeType::Moved,
+                                content: old_ent.map(|e| e.content.clone()).or(prev_entity_content.clone()),
+                                prev_content: prev_entity_content.clone(),
+                                file_path: Some(old_path.clone()),
+                                prev_file_path: Some(new_path),
+                                old_name: None,
+                                old_signature: None,
+                            });
+
+                            // Update tracking state for the old path
+                            if let Some(ent) = old_ent {
+                                prev_entity_content = Some(ent.content.clone());
+                                prev_structural_hash = ent.structural_hash.clone();
+                                prev_content_hash = Some(ent.content_hash.clone());
+                                prev_entity_name = ent.name.clone();
+                                prev_entity_signature = ent.signature.clone();
+                            }
+
+                            visited_files.insert(normalized_old);
+                            current_git_file = old_path;
+                            skip_until_sha = Some(oldest_commit.sha.clone());
+                            following_rename = true;
+                            moved = true;
+                        }
+                    }
+                }
+            }
+            if !moved {
+                // No more file moves — prepend final chunk and stop
+                let mut prepend = std::mem::take(&mut chunk);
+                entries.splice(0..0, prepend);
+                break;
+            }
         }
+        // Cross-file entity move detected inside inner loop — prepend chunk and continue
+        let mut prepend = std::mem::take(&mut chunk);
+        entries.splice(0..0, prepend);
     }
 
     if !found_at_least_once {
@@ -509,24 +695,43 @@ pub fn log_command(opts: LogOptions) {
         std::process::exit(1);
     }
 
-    // Prepend predecessor entries if a rename was detected
+    // Prepend predecessor entries if a rename or cross-file move was detected
     if let Some((mut pred_entries, pred_commits, pred_name)) = prepend_entries.take() {
         if !pred_entries.is_empty() {
             total_commits += pred_commits;
-            // Insert a "Renamed" entry connecting predecessor to the current entity
-            pred_entries.push(LogEntry {
-                short_sha: entries[0].short_sha.clone(),
-                author: entries[0].author.clone(),
-                date: entries[0].date.clone(),
-                message: entries[0].message.clone(),
-                change_type: EntityChangeType::Renamed,
-                content: entries[0].content.clone(),
-                prev_content: pred_entries.last().and_then(|e| e.content.clone()),
-                file_path: entries[0].file_path.clone(),
-                prev_file_path: None,
-                old_name: Some(pred_name),
-                old_signature: None,
-            });
+            // Check if the first entry is already a "Moved" entry (cross-file lookback case).
+            let first_is_moved = entries
+                .first()
+                .map_or(false, |e| matches!(e.change_type, EntityChangeType::Moved));
+
+            if first_is_moved {
+                // Cross-file move case: walk_predecessor may have produced a duplicate
+                // "moved" or "deleted" entry for the same commit. Remove it.
+                if let Some(first_sha) = entries.first().map(|e| e.short_sha.clone()) {
+                    let dup_idx = pred_entries.iter().rposition(|e| {
+                        e.short_sha == first_sha
+                            && matches!(e.change_type, EntityChangeType::Moved | EntityChangeType::Deleted)
+                    });
+                    if let Some(idx) = dup_idx {
+                        pred_entries.drain(idx..);
+                    }
+                }
+            } else {
+                // Same-file rename case: insert a "Renamed" entry connecting predecessor
+                pred_entries.push(LogEntry {
+                    short_sha: entries[0].short_sha.clone(),
+                    author: entries[0].author.clone(),
+                    date: entries[0].date.clone(),
+                    message: entries[0].message.clone(),
+                    change_type: EntityChangeType::Renamed,
+                    content: entries[0].content.clone(),
+                    prev_content: pred_entries.last().and_then(|e| e.content.clone()),
+                    file_path: entries[0].file_path.clone(),
+                    prev_file_path: None,
+                    old_name: Some(pred_name),
+                    old_signature: None,
+                });
+            }
             pred_entries.append(&mut entries);
             entries = pred_entries;
         }
@@ -640,7 +845,7 @@ fn print_terminal(
             if let Some(old_name) = &entry.old_name {
                 println!(
                     "│    {}",
-                    format!("→ renamed {} → ...", old_name).cyan()
+                    format!("→ renamed {} → {}", old_name, query.name).cyan()
                 );
             }
         }
@@ -656,7 +861,7 @@ fn print_terminal(
             if let Some(old_name) = &entry.old_name {
                 println!(
                     "│    {}",
-                    format!("→ renamed {}", old_name).cyan()
+                    format!("→ renamed {} → {}", old_name, query.name).cyan()
                 );
             }
         }
@@ -995,6 +1200,8 @@ fn find_predecessor<'a>(
 /// Cross-file entity search with overload awareness.
 ///
 /// Returns (file_path, entity, change_type, old_name, old_signature).
+/// When `read_from_parent` is true, reads files at the parent commit (for detecting
+/// where an entity came FROM before this commit's changes).
 fn search_entity_cross_file_v2(
     bridge: &GitBridge,
     registry: &ParserRegistry,
@@ -1006,17 +1213,50 @@ fn search_entity_cross_file_v2(
     prev_name: &str,
     prev_signature: Option<&str>,
     exclude_file: &str,
+    read_from_parent: bool,
 ) -> Option<(String, SemanticEntity, EntityChangeType, Option<String>, Option<String>)> {
     let changed_files = bridge.get_commit_changed_files(sha).ok()?;
+    // Normalize exclude_file to forward slashes for consistent comparison
+    let exclude_normalized = exclude_file.replace('\\', "/");
+    // Pre-compute parent SHA for reading deleted files
+    let parent_sha = bridge.get_parent_sha(sha).ok().flatten();
+
+    // Helper: read file content from the appropriate commit
+    let read_file = |file_path: &str| -> Option<String> {
+        if read_from_parent {
+            // Read from parent commit (before this commit's changes)
+            if let Some(ref psha) = parent_sha {
+                if let Ok(Some(c)) = bridge.read_file_at_ref(psha, file_path) {
+                    return Some(c);
+                }
+            }
+            // Fallback for root commits
+            if let Ok(Some(c)) = bridge.read_file_at_ref(sha, file_path) {
+                return Some(c);
+            }
+        } else {
+            // Read from current commit
+            if let Ok(Some(c)) = bridge.read_file_at_ref(sha, file_path) {
+                return Some(c);
+            }
+            // File may have been deleted — try parent
+            if let Some(ref psha) = parent_sha {
+                if let Ok(Some(c)) = bridge.read_file_at_ref(psha, file_path) {
+                    return Some(c);
+                }
+            }
+        }
+        None
+    };
 
     // Pass 1: Exact (name, signature) in other files → Moved
     for file_path in &changed_files {
-        if file_path == exclude_file {
+        if file_path == &exclude_normalized {
             continue;
         }
-        let content = match bridge.read_file_at_ref(sha, file_path) {
-            Ok(Some(c)) => c,
-            _ => continue,
+        let content = match read_file(file_path) {
+            Some(c) => c,
+            None => continue,
         };
         let entities = registry.extract_entities(file_path, &content);
         let found = if let Some(sig) = query_signature {
@@ -1032,12 +1272,12 @@ fn search_entity_cross_file_v2(
     // Pass 2: Same name, different signature + content/structure match → Moved + SignatureChanged
     if prev_content_hash.is_some() || prev_structural_hash.is_some() {
         for file_path in &changed_files {
-            if file_path == exclude_file {
+            if file_path == &exclude_normalized {
                 continue;
             }
-            let content = match bridge.read_file_at_ref(sha, file_path) {
-                Ok(Some(c)) => c,
-                _ => continue,
+            let content = match read_file(file_path) {
+                Some(c) => c,
+                None => continue,
             };
             let entities = registry.extract_entities(file_path, &content);
             for ent in &entities {
@@ -1064,12 +1304,12 @@ fn search_entity_cross_file_v2(
     // Pass 3: Different name + content/structure match → Moved + Renamed
     if prev_content_hash.is_some() || prev_structural_hash.is_some() {
         for file_path in &changed_files {
-            if file_path == exclude_file {
+            if file_path == &exclude_normalized {
                 continue;
             }
-            let content = match bridge.read_file_at_ref(sha, file_path) {
-                Ok(Some(c)) => c,
-                _ => continue,
+            let content = match read_file(file_path) {
+                Some(c) => c,
+                None => continue,
             };
             let entities = registry.extract_entities(file_path, &content);
             for ent in &entities {
@@ -1189,6 +1429,35 @@ fn walk_predecessor(
                             old_signature: None,
                         });
                     } else {
+                        // Before accepting rename/signature-change, verify the entity
+                        // actually changed at this commit (vs its git parent).
+                        if let Some(EntityChangeType::Renamed | EntityChangeType::SignatureChanged) = m.match_type {
+                            if let Ok(Some(parent_sha)) = bridge.get_parent_sha(&commit.sha) {
+                                let parent_file = bridge
+                                    .read_file_at_ref(&parent_sha, &current_git_file)
+                                    .ok()
+                                    .flatten();
+                                let parent_entities: Vec<SemanticEntity> = parent_file
+                                    .as_ref()
+                                    .map(|c| registry.extract_entities(&current_git_file, c))
+                                    .unwrap_or_default();
+
+                                let unchanged_in_parent = parent_entities.iter().any(|pe| {
+                                    pe.name == ent.name
+                                        && pe.signature == ent.signature
+                                        && pe.content_hash == ent.content_hash
+                                });
+                                if unchanged_in_parent {
+                                    prev_entity_content = Some(ent.content.clone());
+                                    prev_structural_hash = ent.structural_hash.clone();
+                                    prev_content_hash = Some(ent.content_hash.clone());
+                                    prev_entity_name = ent.name.clone();
+                                    prev_entity_signature = ent.signature.clone();
+                                    continue;
+                                }
+                            }
+                        }
+
                         let change_type = if let Some(mt) = m.match_type {
                             mt
                         } else {
@@ -1238,6 +1507,7 @@ fn walk_predecessor(
                             prev_content_hash.as_deref(), prev_structural_hash.as_deref(),
                             &prev_entity_name, prev_entity_signature.as_deref(),
                             &current_git_file,
+                            false, // read from current commit
                         );
                         match cross {
                             Some((new_file, ent, change_type, old_name, old_signature)) => {
@@ -1905,5 +2175,358 @@ mod tests {
         );
         assert!(result.is_some());
         assert_eq!(result.unwrap().entity.signature.as_deref(), Some("(bool)"));
+    }
+
+    // --- Cross-file move detection integration tests ---
+
+    /// Helper: create a temp git repo with initial commit and return (GitBridge, ParserRegistry).
+    fn setup_test_repo() -> (tempfile::TempDir, GitBridge, ParserRegistry) {
+        use std::fs;
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = git2::Repository::init(temp.path()).unwrap();
+        // Configure identity for commits
+        repo.config().unwrap().set_str("user.name", "Test").unwrap();
+        repo.config().unwrap().set_str("user.email", "test@test.com").unwrap();
+
+        // Initial commit with a dummy file so HEAD exists
+        let dummy_path = temp.path().join(".gitkeep");
+        fs::write(&dummy_path, "").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(".gitkeep")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+
+        let bridge = GitBridge::open(temp.path()).unwrap();
+        let registry = crate::commands::create_registry(
+            &temp.path().to_string_lossy(),
+        );
+        (temp, bridge, registry)
+    }
+
+    /// Helper: commit a file in the test repo, returns the commit SHA.
+    fn commit_file_in_repo(
+        temp: &tempfile::TempDir,
+        file_path: &str,
+        contents: &str,
+        message: &str,
+    ) -> String {
+        use std::fs;
+        let full_path = temp.path().join(file_path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&full_path, contents).unwrap();
+
+        let repo = git2::Repository::open(temp.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(file_path)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        let head = repo.head().unwrap();
+        let parent = repo.find_commit(head.target().unwrap()).unwrap();
+        let oid = repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent]).unwrap();
+        oid.to_string()
+    }
+
+    /// Helper: remove a file from the repo (git rm), returns the commit SHA.
+    fn remove_file_in_repo(
+        temp: &tempfile::TempDir,
+        file_path: &str,
+        message: &str,
+    ) -> String {
+        use std::fs;
+        let full_path = temp.path().join(file_path);
+        fs::remove_file(&full_path).ok();
+
+        let repo = git2::Repository::open(temp.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(std::path::Path::new(file_path)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        let head = repo.head().unwrap();
+        let parent = repo.find_commit(head.target().unwrap()).unwrap();
+        let oid = repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent]).unwrap();
+        oid.to_string()
+    }
+
+    /// Helper: commit multiple files in a single commit, returns the commit SHA.
+    fn commit_files_in_repo(
+        temp: &tempfile::TempDir,
+        files: &[(&str, &str)],
+        message: &str,
+    ) -> String {
+        use std::fs;
+        for (file_path, contents) in files {
+            let full_path = temp.path().join(file_path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&full_path, contents).unwrap();
+        }
+
+        let repo = git2::Repository::open(temp.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        for (file_path, _) in files {
+            index.add_path(std::path::Path::new(file_path)).unwrap();
+        }
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        let head = repo.head().unwrap();
+        let parent = repo.find_commit(head.target().unwrap()).unwrap();
+        let oid = repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent]).unwrap();
+        oid.to_string()
+    }
+
+    #[test]
+    fn test_cross_file_search_detects_move_from_deleted_file() {
+        // Scenario: method exists in file A, then a single commit moves it to file B
+        // and removes it from file A (file split).
+        // search_entity_cross_file_v2 with read_from_parent=true should find the method
+        // in file A (at the parent commit's content).
+        let (temp, bridge, registry) = setup_test_repo();
+
+        let source_file = "Service.cs";
+        let target_file = "Service.Public.cs";
+
+        // Commit 1: method exists in source file
+        let source_content = r#"
+public class Service
+{
+    public void LaunchGameAsync(int gameId, string param)
+    {
+        DoSomething();
+    }
+
+    public void Helper()
+    {
+    }
+}
+"#;
+        let _sha1 = commit_file_in_repo(&temp, source_file, source_content, "add Service");
+
+        // Commit 2: single commit — create target file AND modify source file (file split)
+        let source_after = r#"
+public class Service
+{
+    public void Helper()
+    {
+    }
+}
+"#;
+        let target_content = r#"
+public class Service
+{
+    public void LaunchGameAsync(int gameId, string param)
+    {
+        DoSomething();
+    }
+}
+"#;
+        let sha2 = commit_files_in_repo(
+            &temp,
+            &[(target_file, target_content), (source_file, source_after)],
+            "split Service into partial classes",
+        );
+
+        // Extract entity from the target file
+        let entities = registry.extract_entities(target_file, target_content);
+        let launch_entity = entities.iter().find(|e| e.name == "LaunchGameAsync")
+            .expect("Should find LaunchGameAsync in target file");
+
+        // Search for the entity in other files at the split commit (read from parent)
+        let result = search_entity_cross_file_v2(
+            &bridge,
+            &registry,
+            &sha2,
+            &launch_entity.name,
+            launch_entity.signature.as_deref(),
+            Some(launch_entity.content_hash.as_str()),
+            launch_entity.structural_hash.as_deref(),
+            &launch_entity.name,
+            launch_entity.signature.as_deref(),
+            target_file,
+            true, // read from parent — find where entity came FROM
+        );
+
+        assert!(result.is_some(), "Should find LaunchGameAsync in source file");
+        let (found_file, found_ent, change_type, old_name, old_sig) = result.unwrap();
+        assert_eq!(found_file, source_file, "Should find entity in source file");
+        assert_eq!(found_ent.name, "LaunchGameAsync");
+        assert!(matches!(change_type, EntityChangeType::Moved));
+        assert!(old_name.is_none());
+        assert!(old_sig.is_none());
+    }
+
+    #[test]
+    fn test_cross_file_search_path_separator_normalization() {
+        // Unit test: verify that the normalization logic in search_entity_cross_file_v2
+        // correctly converts backslash exclude_file to forward slashes for comparison.
+        // On Windows, the log command passes paths like "Runtime\Service\Other.cs" as exclude,
+        // while git returns "Runtime/Service/Other.cs". The function normalizes before comparing.
+        //
+        // We test this indirectly: the real integration test is the LaunchGameAsync case above.
+        // Here we just verify the string normalization works:
+        let backslash_path = "Runtime\\Script\\ExportApi\\GameLauncher.cs";
+        let forward_path = "Runtime/Script/ExportApi/GameLauncher.cs";
+        let normalized = backslash_path.replace('\\', "/");
+        assert_eq!(normalized, forward_path, "normalize should convert backslashes to forward slashes");
+
+        // Also verify the comparison pattern used in the function
+        assert_eq!(normalized, forward_path);
+        assert_ne!(backslash_path, forward_path, "raw backslash path should NOT match forward slash path");
+    }
+
+    #[test]
+    fn test_cross_file_search_read_from_parent_vs_current() {
+        // When read_from_parent=true, reads files at the parent commit.
+        // This matters when a file was modified in the current commit (e.g., entity removed).
+        let (temp, bridge, registry) = setup_test_repo();
+
+        let source_file = "GameLauncher.cs";
+
+        // Commit 1: method in source file
+        let old_content = r#"
+public class GameLauncher
+{
+    public void LaunchGameAsync(int id)
+    {
+        StartGame(id);
+    }
+}
+"#;
+        let _sha1 = commit_file_in_repo(&temp, source_file, old_content, "add GameLauncher");
+
+        // Commit 2: modify source file — remove the method
+        let new_content = r#"
+public class GameLauncher
+{
+}
+"#;
+        let sha2 = commit_file_in_repo(&temp, source_file, new_content, "remove method");
+
+        // With read_from_parent=true: should find LaunchGameAsync in old content
+        let result_parent = search_entity_cross_file_v2(
+            &bridge, &registry, &sha2,
+            "LaunchGameAsync", None,
+            None, None,
+            "LaunchGameAsync", None,
+            "nonexistent.cs", // don't exclude anything
+            true, // read from parent
+        );
+        assert!(result_parent.is_some(), "Should find method in parent commit content");
+        let (file, ent, _, _, _) = result_parent.unwrap();
+        assert_eq!(file, source_file);
+        assert_eq!(ent.name, "LaunchGameAsync");
+
+        // With read_from_parent=false: reads current commit where method is gone
+        let result_current = search_entity_cross_file_v2(
+            &bridge, &registry, &sha2,
+            "LaunchGameAsync", None,
+            None, None,
+            "LaunchGameAsync", None,
+            "nonexistent.cs",
+            false, // read from current commit
+        );
+        assert!(result_current.is_none(), "Should NOT find method in current commit content");
+    }
+
+    #[test]
+    fn test_cross_file_search_excludes_current_file() {
+        // Verify that the exclude_file parameter works correctly
+        let (temp, bridge, registry) = setup_test_repo();
+
+        let content = r#"
+public class Service
+{
+    public void Process()
+    {
+    }
+}
+"#;
+        let sha = commit_file_in_repo(&temp, "Service.cs", content, "add Service");
+
+        let entities = registry.extract_entities("Service.cs", content);
+        let process_ent = entities.iter().find(|e| e.name == "Process").unwrap();
+
+        // Exclude Service.cs — should find nothing (no other files)
+        let result = search_entity_cross_file_v2(
+            &bridge, &registry, &sha,
+            &process_ent.name, process_ent.signature.as_deref(),
+            Some(process_ent.content_hash.as_str()),
+            process_ent.structural_hash.as_deref(),
+            &process_ent.name, process_ent.signature.as_deref(),
+            "Service.cs",
+            true,
+        );
+        assert!(result.is_none(), "Should not find entity when its file is excluded");
+    }
+
+    #[test]
+    fn test_cross_file_search_detects_rename_across_files() {
+        // Method renamed and moved: Process → Handle in new file
+        let (temp, bridge, registry) = setup_test_repo();
+
+        let old_content = r#"
+public class Service
+{
+    public void Process(int id)
+    {
+        DoWork(id);
+    }
+}
+"#;
+        let _sha1 = commit_file_in_repo(&temp, "Service.cs", old_content, "add Service");
+
+        let new_content = r#"
+public class Handler
+{
+    public void Handle(int id)
+    {
+        DoWork(id);
+    }
+}
+"#;
+        // Single commit: create Handler.cs and modify Service.cs
+        let modified_source = r#"
+public class Service
+{
+}
+"#;
+        let sha2 = commit_files_in_repo(
+            &temp,
+            &[("Handler.cs", new_content), ("Service.cs", modified_source)],
+            "rename and move",
+        );
+
+        // Extract entity from the new file
+        let entities = registry.extract_entities("Handler.cs", new_content);
+        let handle_ent = entities.iter().find(|e| e.name == "Handle").unwrap();
+
+        // Search for renamed entity by content hash (read from parent to find old file)
+        let result = search_entity_cross_file_v2(
+            &bridge, &registry, &sha2,
+            "Handle", handle_ent.signature.as_deref(),
+            Some(handle_ent.content_hash.as_str()),
+            handle_ent.structural_hash.as_deref(),
+            "Handle", handle_ent.signature.as_deref(),
+            "Handler.cs",
+            true,
+        );
+
+        assert!(result.is_some(), "Should find renamed entity via content/structural hash");
+        let (found_file, found_ent, _, _, _) = result.unwrap();
+        assert_eq!(found_file, "Service.cs");
+        // The found entity has the OLD name (from parent commit)
+        assert!(found_ent.name == "Process" || found_ent.name == "Handle",
+            "Found entity should be Process or Handle, got: {}", found_ent.name);
     }
 }

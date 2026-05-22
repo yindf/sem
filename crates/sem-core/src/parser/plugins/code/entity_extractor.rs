@@ -350,6 +350,31 @@ fn find_name_byte_range(node: Node, _source: &[u8]) -> Option<(usize, usize)> {
         }
     }
 
+    // C#/Java field_declaration: name is inside variable_declaration > variable_declarator
+    if node_type == "field_declaration" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            return Some((name_node.start_byte(), name_node.end_byte()));
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                if let Some(decl_name) = child.child_by_field_name("name") {
+                    return Some((decl_name.start_byte(), decl_name.end_byte()));
+                }
+            }
+            if child.kind() == "variable_declaration" {
+                let mut inner = child.walk();
+                for grandchild in child.named_children(&mut inner) {
+                    if grandchild.kind() == "variable_declarator" {
+                        if let Some(decl_name) = grandchild.child_by_field_name("name") {
+                            return Some((decl_name.start_byte(), decl_name.end_byte()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Go var/const/type declarations: name is inside var_spec/const_spec/type_spec.
     // Grouped forms like `var (...)` wrap specs in var_spec_list/type_spec_list.
     if node_type == "var_declaration"
@@ -585,6 +610,31 @@ fn extract_name(node: Node, source: &[u8]) -> Option<String> {
             if child.kind() == "variable_declarator" {
                 if let Some(decl_name) = child.child_by_field_name("name") {
                     return Some(node_text(decl_name, source).to_string());
+                }
+            }
+        }
+    }
+
+    // C#/Java field_declaration: name is inside variable_declaration > variable_declarator
+    if node_type == "field_declaration" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            return Some(node_text(name_node, source).to_string());
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                if let Some(decl_name) = child.child_by_field_name("name") {
+                    return Some(node_text(decl_name, source).to_string());
+                }
+            }
+            if child.kind() == "variable_declaration" {
+                let mut inner = child.walk();
+                for grandchild in child.named_children(&mut inner) {
+                    if grandchild.kind() == "variable_declarator" {
+                        if let Some(decl_name) = grandchild.child_by_field_name("name") {
+                            return Some(node_text(decl_name, source).to_string());
+                        }
+                    }
                 }
             }
         }

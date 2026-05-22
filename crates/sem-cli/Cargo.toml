@@ -42,8 +42,11 @@ pkg-url = "{ repo }/releases/download/v{ version }/sem-linux-arm64.tar.gz"
 pkg-url = "{ repo }/releases/download/v{ version }/sem-darwin-arm64.tar.gz"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-url = "{ repo }/releases/download/v{ version }/sem-windows-x86_64.zip"
+pkg-url = "{ repo }/releases/download/v{ version }/sem-windows-x86_21.zip"
 pkg-fmt = "zip"
 
 [features]
 vendored-openssl = ["openssl-sys/vendored"]
+
+[dev-dependencies]
+tempfile = "3"

@@ -1786,4 +1786,108 @@ test "basic addition" {
         assert_eq!(types["Color"], "enum");
         assert_eq!(types["Person"], "struct");
     }
+
+    #[test]
+    fn test_csharp_const_field_extraction() {
+        let code = r#"
+namespace TestNamespace
+{
+    public class Calculator
+    {
+        private const int MaxValue = 100;
+        private const int MinValue = 0;
+        public const string Version = "1.0";
+
+        public int Add(int a, int b)
+        {
+            return a + b;
+        }
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Test.cs");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
+        eprintln!("C# const fields: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+
+        // Should find namespace, class, method
+        assert!(names.contains(&"TestNamespace"), "Should find namespace, got: {:?}", names);
+        assert!(names.contains(&"Calculator"), "Should find class, got: {:?}", names);
+        assert!(names.contains(&"Add"), "Should find method, got: {:?}", names);
+
+        // Should find const fields
+        let fields: Vec<_> = entities.iter().filter(|e| e.entity_type == "field").collect();
+        assert!(
+            fields.iter().any(|f| f.name == "MaxValue"),
+            "Should find MaxValue field, got fields: {:?}",
+            fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        assert!(fields.iter().any(|f| f.name == "MinValue"), "Should find MinValue field");
+        assert!(fields.iter().any(|f| f.name == "Version"), "Should find Version field");
+
+        // Fields should be nested under the class
+        let max_value = fields.iter().find(|f| f.name == "MaxValue").unwrap();
+        assert!(max_value.parent_id.is_some(), "MaxValue should have parent_id");
+    }
+
+    #[test]
+    fn test_csharp_const_string_fields() {
+        // Real-world pattern: class with only const string/uint fields (like IRankDef)
+        let code = r#"
+namespace jj.TKMatchService.Runtime
+{
+    public class IRankDef
+    {
+        public const uint RankSize = 100;
+        public const string C_S_RLB_V2_SECRET_INTRANET = "1rW8zhh4v8NrVgku";
+        public const string C_S_RLB_V2_SECRET_RELEASE = "u6beFMTXRhQujUGi";
+        public const string TOP_RANK_V2 = "http://msgdx.srv.jj.cn/rlbext/ApiV2/GetRLBInfo";
+        public const string RANK_WEEK_MONTH_YEAR = "https://msgdx.srv.jj.cn/rlbext/GetMatchRLBMember.aspx";
+        public const string RANK = "https://msgdx.srv.jj.cn/rlbext/api/RLB/GetTVSection";
+        public const string RANK_TEST = "http://test.webservice.jjweb.cn/rlb/api/RLB/GetTVSection";
+        public const string RANK_GROUP = "https://msgdx.srv.jj.cn/rlbext/GetGrlOneGroup.aspx";
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "IRankDef.cs");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
+        eprintln!("C# IRankDef: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+
+        // Should find all 8 const fields
+        assert!(names.contains(&"RankSize"), "Should find RankSize, got: {:?}", names);
+        assert!(names.contains(&"C_S_RLB_V2_SECRET_INTRANET"), "Should find C_S_RLB_V2_SECRET_INTRANET, got: {:?}", names);
+        assert!(names.contains(&"TOP_RANK_V2"), "Should find TOP_RANK_V2, got: {:?}", names);
+        assert!(names.contains(&"RANK_WEEK_MONTH_YEAR"), "Should find RANK_WEEK_MONTH_YEAR, got: {:?}", names);
+        assert!(names.contains(&"RANK"), "Should find RANK, got: {:?}", names);
+        assert!(names.contains(&"RANK_TEST"), "Should find RANK_TEST, got: {:?}", names);
+        assert!(names.contains(&"RANK_GROUP"), "Should find RANK_GROUP, got: {:?}", names);
+
+        // All fields should have entity_type "field"
+        let field_count = entities.iter().filter(|e| e.entity_type == "field").count();
+        assert_eq!(field_count, 8, "Should find exactly 8 fields, got {}", field_count);
+    }
+
+    #[test]
+    fn test_csharp_field_with_multiple_declarators() {
+        // Multiple variables in one field declaration
+        let code = r#"
+public class Colors
+{
+    public const int Red = 0, Green = 1, Blue = 2;
+    private static readonly string Name = "test";
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Colors.cs");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("C# multi-declarator fields: {:?}", names);
+
+        // Should find at least the first declarator name (Red)
+        assert!(names.contains(&"Red"), "Should find Red, got: {:?}", names);
+        // Should also find the static readonly field
+        assert!(names.contains(&"Name"), "Should find Name, got: {:?}", names);
+    }
 }
