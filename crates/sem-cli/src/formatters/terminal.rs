@@ -55,7 +55,11 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
 
         let header = format!("─ {file_path} ");
         let pad_len = 55usize.saturating_sub(header.len());
-        lines.push(format!("┌{header}{}", "─".repeat(pad_len)).dimmed().to_string());
+        lines.push(
+            format!("┌{header}{}", "─".repeat(pad_len))
+                .dimmed()
+                .to_string(),
+        );
         lines.push("│".dimmed().to_string());
 
         for &idx in indices {
@@ -67,36 +71,18 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
             }
 
             let (symbol, tag) = match change.change_type {
-                ChangeType::Added => (
-                    "⊕".green().to_string(),
-                    "[added]".green().to_string(),
-                ),
+                ChangeType::Added => ("⊕".green().to_string(), "[added]".green().to_string()),
                 ChangeType::Modified => {
                     let is_cosmetic = change.structural_change == Some(false);
                     if is_cosmetic {
-                        (
-                            "~".dimmed().to_string(),
-                            "[cosmetic]".dimmed().to_string(),
-                        )
+                        ("~".dimmed().to_string(), "[cosmetic]".dimmed().to_string())
                     } else {
-                        (
-                            "∆".yellow().to_string(),
-                            "[modified]".yellow().to_string(),
-                        )
+                        ("∆".yellow().to_string(), "[modified]".yellow().to_string())
                     }
                 }
-                ChangeType::Deleted => (
-                    "⊖".red().to_string(),
-                    "[deleted]".red().to_string(),
-                ),
-                ChangeType::Moved => (
-                    "→".blue().to_string(),
-                    "[moved]".blue().to_string(),
-                ),
-                ChangeType::Renamed => (
-                    "↻".cyan().to_string(),
-                    "[renamed]".cyan().to_string(),
-                ),
+                ChangeType::Deleted => ("⊖".red().to_string(), "[deleted]".red().to_string()),
+                ChangeType::Moved => ("→".blue().to_string(), "[moved]".blue().to_string()),
+                ChangeType::Renamed => ("↻".cyan().to_string(), "[renamed]".cyan().to_string()),
                 ChangeType::Reordered => (
                     "↕".magenta().to_string(),
                     "[reordered]".magenta().to_string(),
@@ -255,10 +241,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
             }
 
             // Show rename/move details
-            if matches!(
-                change.change_type,
-                ChangeType::Renamed | ChangeType::Moved
-            ) {
+            if matches!(change.change_type, ChangeType::Renamed | ChangeType::Moved) {
                 if let Some(ref old_path) = change.old_file_path {
                     lines.push(format!(
                         "{}    {}",
@@ -295,7 +278,11 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
         );
     }
     if result.deleted_count > 0 {
-        parts.push(format!("{} deleted", result.deleted_count).red().to_string());
+        parts.push(
+            format!("{} deleted", result.deleted_count)
+                .red()
+                .to_string(),
+        );
     }
     if result.moved_count > 0 {
         parts.push(format!("{} moved", result.moved_count).blue().to_string());
@@ -326,6 +313,28 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
         parts.join(", "),
         result.file_count,
     ));
+
+    // Show noise-filtered line when entities were analyzed
+    let entities_analyzed = result
+        .total_entities_before
+        .max(result.total_entities_after);
+    let changes_detected = result.added_count
+        + result.modified_count
+        + result.deleted_count
+        + result.moved_count
+        + result.renamed_count
+        + result.reordered_count;
+    if entities_analyzed > changes_detected {
+        let noise = entities_analyzed - changes_detected;
+        lines.push(
+            format!(
+                "Analyzed {} entities, {} unchanged filtered out",
+                entities_analyzed, noise
+            )
+            .dimmed()
+            .to_string(),
+        );
+    }
 
     // Warn if fallback chunking was used (unsupported file extension)
     let chunk_files: Vec<&str> = result

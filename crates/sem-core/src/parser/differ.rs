@@ -1,7 +1,21 @@
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::git::types::FileChange;
+
+macro_rules! maybe_par_iter {
+    ($slice:expr) => {{
+        #[cfg(feature = "parallel")]
+        {
+            $slice.par_iter()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            $slice.iter()
+        }
+    }};
+}
 use crate::model::change::{ChangeType, SemanticChange};
 use crate::model::entity::SemanticEntity;
 use crate::model::identity::match_entities;
@@ -21,6 +35,8 @@ pub struct DiffResult {
     pub reordered_count: usize,
     pub signature_changed_count: usize,
     pub orphan_count: usize,
+    pub total_entities_before: usize,
+    pub total_entities_after: usize,
 }
 
 pub fn compute_semantic_diff(
@@ -30,83 +46,97 @@ pub fn compute_semantic_diff(
     author: Option<&str>,
 ) -> DiffResult {
     // Process files in parallel: each file's entity extraction and matching is independent
-    let per_file_changes: Vec<(String, Vec<SemanticChange>)> = file_changes
-        .par_iter()
-        .filter_map(|file| {
-            let content_hint = file.after_content.as_deref()
-                .or(file.before_content.as_deref())
-                .unwrap_or("");
-            let resolved = registry.resolve_file_path(&file.file_path);
-            let detection_path = resolved.as_deref().unwrap_or(&file.file_path);
-            let plugin = registry.get_plugin_with_content(detection_path, content_hint)?;
+    let per_file_changes: Vec<(String, Vec<SemanticChange>, usize, usize)> =
+        maybe_par_iter!(file_changes)
+            .filter_map(|file| {
+                let content_hint = file
+                    .after_content
+                    .as_deref()
+                    .or(file.before_content.as_deref())
+                    .unwrap_or("");
+                let resolved = registry.resolve_file_path(&file.file_path);
+                let detection_path = resolved.as_deref().unwrap_or(&file.file_path);
+                let plugin = registry.get_plugin_with_content(detection_path, content_hint)?;
 
-            let before_entities = if let Some(ref content) = file.before_content {
-                let before_path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
-                let before_resolved = registry.resolve_file_path(before_path);
-                let before_detection = before_resolved.as_deref().unwrap_or(before_path);
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    plugin.extract_entities(content, before_detection)
-                })) {
-                    Ok(entities) => entities,
-                    Err(_) => Vec::new(),
+                let before_entities = if let Some(ref content) = file.before_content {
+                    let before_path = file.old_file_path.as_deref().unwrap_or(&file.file_path);
+                    let before_resolved = registry.resolve_file_path(before_path);
+                    let before_detection = before_resolved.as_deref().unwrap_or(before_path);
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        plugin.extract_entities(content, before_detection)
+                    })) {
+                        Ok(entities) => entities,
+                        Err(_) => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                let after_entities = if let Some(ref content) = file.after_content {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        plugin.extract_entities(content, detection_path)
+                    })) {
+                        Ok(entities) => entities,
+                        Err(_) => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                let before_count = before_entities.len();
+                let after_count = after_entities.len();
+
+                let sim_fn = |a: &crate::model::entity::SemanticEntity,
+                              b: &crate::model::entity::SemanticEntity|
+                 -> f64 { plugin.compute_similarity(a, b) };
+
+                let mut result = match_entities(
+                    &before_entities,
+                    &after_entities,
+                    &file.file_path,
+                    Some(&sim_fn),
+                    commit_sha,
+                    author,
+                );
+
+                // Suppress parent entities whose modification is already explained
+                // by child entity changes (e.g. impl blocks when methods changed).
+                suppress_redundant_parents(&mut result.changes, &before_entities, &after_entities);
+
+                // Detect orphan changes (lines that changed outside any entity span).
+                let orphans = detect_orphan_changes(
+                    file,
+                    &before_entities,
+                    &after_entities,
+                    commit_sha,
+                    author,
+                );
+                result.changes.extend(orphans);
+
+                result.changes.sort_by_key(|change| change.entity_line);
+
+                if result.changes.is_empty() {
+                    None
+                } else {
+                    Some((
+                        file.file_path.clone(),
+                        result.changes,
+                        before_count,
+                        after_count,
+                    ))
                 }
-            } else {
-                Vec::new()
-            };
-
-            let after_entities = if let Some(ref content) = file.after_content {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    plugin.extract_entities(content, detection_path)
-                })) {
-                    Ok(entities) => entities,
-                    Err(_) => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            };
-
-            let sim_fn = |a: &crate::model::entity::SemanticEntity,
-                          b: &crate::model::entity::SemanticEntity|
-             -> f64 { plugin.compute_similarity(a, b) };
-
-            let mut result = match_entities(
-                &before_entities,
-                &after_entities,
-                &file.file_path,
-                Some(&sim_fn),
-                commit_sha,
-                author,
-            );
-
-            // Suppress parent entities whose modification is already explained
-            // by child entity changes (e.g. impl blocks when methods changed).
-            suppress_redundant_parents(&mut result.changes, &before_entities, &after_entities);
-
-            // Detect orphan changes (lines that changed outside any entity span).
-            let orphans = detect_orphan_changes(
-                file,
-                &before_entities,
-                &after_entities,
-                commit_sha,
-                author,
-            );
-            result.changes.extend(orphans);
-
-            result.changes.sort_by_key(|change| change.entity_line);
-
-            if result.changes.is_empty() {
-                None
-            } else {
-                Some((file.file_path.clone(), result.changes))
-            }
-        })
-        .collect();
+            })
+            .collect();
 
     let mut all_changes: Vec<SemanticChange> = Vec::new();
     let mut files_with_changes: HashSet<String> = HashSet::new();
-    for (file_path, changes) in per_file_changes {
+    let mut total_entities_before: usize = 0;
+    let mut total_entities_after: usize = 0;
+    for (file_path, changes, before_count, after_count) in per_file_changes {
         files_with_changes.insert(file_path);
         all_changes.extend(changes);
+        total_entities_before += before_count;
+        total_entities_after += after_count;
     }
 
     // Single-pass counting (exclude orphan changes from entity counts)
@@ -146,6 +176,8 @@ pub fn compute_semantic_diff(
         reordered_count,
         signature_changed_count,
         orphan_count,
+        total_entities_before,
+        total_entities_after,
     }
 }
 
@@ -159,9 +191,18 @@ fn suppress_redundant_parents(
     }
 
     const CONTAINER_TYPES: &[&str] = &[
-        "impl", "trait", "module", "class", "interface", "mixin",
-        "extension", "namespace", "export", "package",
-        "svelte_instance_script", "svelte_module_script",
+        "impl",
+        "trait",
+        "module",
+        "class",
+        "interface",
+        "mixin",
+        "extension",
+        "namespace",
+        "export",
+        "package",
+        "svelte_instance_script",
+        "svelte_module_script",
         "object",
     ];
 
@@ -187,18 +228,28 @@ fn suppress_redundant_parents(
 
     let mut suppress: HashSet<String> = HashSet::new();
     for change in changes.iter() {
-        if !matches!(change.change_type, ChangeType::Modified | ChangeType::Added | ChangeType::Deleted | ChangeType::SignatureChanged) {
+        if !matches!(
+            change.change_type,
+            ChangeType::Modified | ChangeType::Added | ChangeType::Deleted | ChangeType::SignatureChanged
+        ) {
             continue;
         }
         if !CONTAINER_TYPES.contains(&change.entity_type.as_str()) {
             continue;
         }
         let eid = change.entity_id.as_str();
-        let b_children = before_children.get(eid).map(|v| v.as_slice()).unwrap_or(&[]);
+        let b_children = before_children
+            .get(eid)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let a_children = after_children.get(eid).map(|v| v.as_slice()).unwrap_or(&[]);
 
-        let has_changed_child = b_children.iter().any(|c| changed_ids.contains(c.id.as_str()))
-            || a_children.iter().any(|c| changed_ids.contains(c.id.as_str()));
+        let has_changed_child = b_children
+            .iter()
+            .any(|c| changed_ids.contains(c.id.as_str()))
+            || a_children
+                .iter()
+                .any(|c| changed_ids.contains(c.id.as_str()));
         if !has_changed_child {
             continue;
         }
@@ -249,7 +300,8 @@ fn suppress_redundant_parents(
         .filter_map(|c| {
             let old_name = c.old_entity_name.as_deref()?;
             let after_entity = after_by_id.get(c.entity_id.as_str())?;
-            before.iter()
+            before
+                .iter()
                 .find(|e| {
                     e.name == old_name
                         && e.entity_type == after_entity.entity_type
@@ -263,13 +315,18 @@ fn suppress_redundant_parents(
         changes.retain(|c| {
             !(c.change_type == ChangeType::Moved
                 && c.old_entity_name.is_none()
-                && c.old_parent_id.as_deref()
+                && c.old_parent_id
+                    .as_deref()
                     .map_or(false, |pid| renamed_before_ids.contains(pid)))
         });
     }
 }
 
-fn strip_children_content(content: &str, parent_start_line: usize, children: &[&SemanticEntity]) -> String {
+fn strip_children_content(
+    content: &str,
+    parent_start_line: usize,
+    children: &[&SemanticEntity],
+) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let mut excluded: HashSet<usize> = HashSet::new();
     for child in children {
@@ -281,7 +338,9 @@ fn strip_children_content(content: &str, parent_start_line: usize, children: &[&
             }
         }
     }
-    lines.iter().enumerate()
+    lines
+        .iter()
+        .enumerate()
         .filter(|(i, _)| !excluded.contains(i))
         .map(|(_, l)| l.trim())
         .filter(|l| !l.is_empty())
@@ -388,21 +447,43 @@ mod tests {
         }
     }
 
+    fn renamed_file(old_path: &str, new_path: &str, before: &str, after: &str) -> FileChange {
+        FileChange {
+            file_path: new_path.to_string(),
+            status: FileStatus::Renamed,
+            old_file_path: Some(old_path.to_string()),
+            before_content: Some(before.to_string()),
+            after_content: Some(after.to_string()),
+        }
+    }
+
     #[test]
     fn test_parent_suppressed_when_only_child_modified() {
         let before = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id)\n";
         let after  = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id, include_deleted=False)\n";
 
         let registry = create_default_registry();
-        let result = compute_semantic_diff(&[modified_file("svc.py", before, after)], &registry, None, None);
+        let result = compute_semantic_diff(
+            &[modified_file("svc.py", before, after)],
+            &registry,
+            None,
+            None,
+        );
 
-        let names: Vec<&str> = result.changes.iter().map(|c| c.entity_name.as_str()).collect();
+        let names: Vec<&str> = result
+            .changes
+            .iter()
+            .map(|c| c.entity_name.as_str())
+            .collect();
         assert!(
             result.changes.iter().any(|c| c.entity_name == "get_user"),
             "expected method get_user in changes, got: {names:?}"
         );
         assert!(
-            !result.changes.iter().any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
+            !result
+                .changes
+                .iter()
+                .any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
             "class should be suppressed when only the method body changed, got: {names:?}"
         );
     }
@@ -413,16 +494,49 @@ mod tests {
         let after  = "class UserService(BaseService):\n    def get_user(self, user_id):\n        return db.find(user_id, include_deleted=False)\n";
 
         let registry = create_default_registry();
-        let result = compute_semantic_diff(&[modified_file("svc.py", before, after)], &registry, None, None);
+        let result = compute_semantic_diff(
+            &[modified_file("svc.py", before, after)],
+            &registry,
+            None,
+            None,
+        );
 
-        let names: Vec<&str> = result.changes.iter().map(|c| c.entity_name.as_str()).collect();
+        let names: Vec<&str> = result
+            .changes
+            .iter()
+            .map(|c| c.entity_name.as_str())
+            .collect();
         assert!(
             result.changes.iter().any(|c| c.entity_name == "get_user"),
             "expected method get_user in changes, got: {names:?}"
         );
         assert!(
-            result.changes.iter().any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
+            result
+                .changes
+                .iter()
+                .any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
             "class should remain Modified when its own declaration changed, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn renamed_file_with_edited_entity_reports_move_not_add_delete() {
+        let before = "def foo():\n    return alpha + beta + gamma\n";
+        let after = "def foo():\n    return one + two + three\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(
+            &[renamed_file("old.py", "new.py", before, after)],
+            &registry,
+            None,
+            None,
+        );
+
+        assert_eq!(result.added_count, 0);
+        assert_eq!(result.deleted_count, 0);
+        assert_eq!(result.moved_count, 1);
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].entity_name, "foo");
+        assert_eq!(result.changes[0].old_file_path.as_deref(), Some("old.py"));
     }
 }

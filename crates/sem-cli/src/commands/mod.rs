@@ -6,6 +6,7 @@ pub mod graph;
 pub mod impact;
 pub mod log;
 pub mod setup;
+pub mod stats;
 pub mod verify;
 
 use colored::Colorize;
