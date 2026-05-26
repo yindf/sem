@@ -2057,6 +2057,177 @@ public class Colors
     }
 
     #[test]
+    fn test_csharp_preprocessor_minimal_repro() {
+        // Minimal reproduction of the pattern that breaks tree-sitter
+        let code = r#"
+namespace MyApp
+{
+    public class Service
+    {
+        public void Method()
+        {
+            if (true)
+            {
+#if UNITY_IOS
+                if (x == 1)
+#else
+                if (x == 2 || x == 3)
+#endif
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let (entities, tree) = plugin.extract_entities_with_tree(code, "Service.cs");
+        eprintln!("Minimal repro entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        if let Some(ref t) = tree {
+            eprintln!("has_error: {}", t.root_node().has_error());
+        }
+        assert!(entities.iter().any(|e| e.name == "MyApp"), "Should find namespace");
+        assert!(entities.iter().any(|e| e.name == "Service"), "Should find class");
+    }
+
+    #[test]
+    fn test_csharp_preprocessor_real_patterns() {
+        // Test the ACTUAL patterns from AccountService.cs that break parsing
+        let code = r#"
+using System.Threading;
+using jj.AOT.Runtime;
+
+namespace jj.TKGameService.Runtime
+{
+    using Cysharp.Threading.Tasks;
+    using System;
+
+    [ConstructorInjector(typeof(ILoginService))]
+    [ConstructorInjector(typeof(IGameNotification))]
+    public partial class AccountService : IAccountService
+    {
+        private const string TAG = "AccountService";
+
+        public async UniTask<(bool isCancel, string)> StartFaceAuthAsync(string session)
+        {
+            if (ALIPAY_APPID_LIST.TryGetValue("test", out var appId))
+            {
+                var decryptoId = appId;
+#if UNITY_IOS
+                var returnUrl = "jjlordunion://";
+#else
+                var returnUrl = "verifycb://main?queryResult=true";
+#endif
+                if (session != null)
+                {
+                    return (false, "");
+                }
+            }
+            return (true, null);
+        }
+
+        public void ProcessResponse()
+        {
+            if (initAuthData["responseCode"] != null)
+            {
+                var respCode = 0;
+#if UNITY_IOS
+                if (respCode == 0)
+#else
+                if (respCode == 1 || respCode == 2)
+#endif
+                {
+                    return;
+                }
+            }
+        }
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+        public void OnAndroid() { }
+#elif UNITY_IOS && !UNITY_EDITOR
+        public void OnIOS() { }
+#else
+        public void OnEditor() { }
+#endif
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let (entities, tree) = plugin.extract_entities_with_tree(code, "AccountService.cs");
+
+        eprintln!("Real patterns: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        if let Some(ref t) = tree {
+            eprintln!("has_error: {}", t.root_node().has_error());
+        }
+
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"jj.TKGameService.Runtime"), "Should find namespace, got: {:?}", names);
+        assert!(names.contains(&"AccountService"), "Should find class, got: {:?}", names);
+    }
+
+    /// Root cause test: proves that #if/#else splitting a single if-statement
+    /// (condition inside branches, body outside) causes tree-sitter ERROR nodes.
+    /// In small files the errors are contained, but in large files with deep
+    /// nesting they cascade and break the entire AST (namespace/class undetected,
+    /// all entities lose parent_id).
+    #[test]
+    fn test_csharp_preprocessor_split_statement_root_cause() {
+        // This is the exact pattern from AccountService.cs lines 1010-1014:
+        // #if/#else/#endif splits an if-statement — condition inside branches,
+        // body { ... } outside after #endif.
+        let code = r#"
+namespace MyApp
+{
+    public class Service
+    {
+        public void Method()
+        {
+            var respCode = 0;
+#if UNITY_IOS
+            if (respCode == 0)
+#else
+            if (respCode == 1 || respCode == 2)
+#endif
+            {
+                return;
+            }
+        }
+    }
+}
+"#;
+
+        // --- Step 1: Prove tree-sitter produces ERROR nodes on this pattern ---
+        let language = tree_sitter_c_sharp::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let raw_tree = parser.parse(code.as_bytes(), None).unwrap();
+
+        assert!(
+            raw_tree.root_node().has_error(),
+            "ROOT CAUSE: tree-sitter must report errors when #if/#else splits \
+            an if-statement across branches. Each branch produces an incomplete \
+            if-statement (condition without body), then braces after #endif are orphaned."
+        );
+
+        // --- Step 2: Prove our preprocessor stripping eliminates the errors ---
+        let plugin = CodeParserPlugin;
+        let (entities, tree) = plugin.extract_entities_with_tree(code, "Service.cs");
+
+        assert!(
+            !tree.as_ref().unwrap().root_node().has_error(),
+            "After preprocessor stripping (keeping one branch): tree should have NO errors"
+        );
+
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"MyApp"), "Should find namespace after fix, got: {:?}", names);
+        assert!(names.contains(&"Service"), "Should find class after fix, got: {:?}", names);
+
+        let method = entities.iter().find(|e| e.name == "Method").unwrap();
+        assert!(method.parent_id.is_some(), "Method should have parent_id after fix");
+    }
+
+    #[test]
     fn test_csharp_preprocessor_if_else() {
         // C# preprocessor #if/#else/#endif causes tree-sitter ERROR nodes.
         // The fix strips preprocessor directives and keeps only one branch.
