@@ -28,7 +28,17 @@ pub fn parent_name(
                     None => break,
                 }
             }
-            None => break,
+            None => {
+                // Fallback: parent entity not in by_id (e.g. in a different
+                // file for partial classes). Extract the name from the ID.
+                // ID format: "file.cs::entity_type::Name" or "parent_id::Name(sig)"
+                if let Some(name) = extract_name_from_id(pid) {
+                    if !name.is_empty() {
+                        parts.push(name);
+                    }
+                }
+                break;
+            }
         }
     }
     if parts.is_empty() {
@@ -36,6 +46,15 @@ pub fn parent_name(
     }
     parts.reverse();
     Some(parts.join("."))
+}
+
+/// Extract the entity name from an entity ID string.
+/// "file.cs::class::AccountService" → "AccountService"
+/// "file.cs::class::AccountService::GetLogoutData()" → "GetLogoutData"
+fn extract_name_from_id(id: &str) -> Option<&str> {
+    let last = id.rsplit("::").next()?;
+    // Strip signature part (parentheses) for display name
+    Some(last.split('(').next()?.trim())
 }
 
 pub struct MatchResult {

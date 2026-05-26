@@ -28,7 +28,6 @@ impl std::fmt::Display for ChangeType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct SemanticChange {
     pub id: String,
     pub entity_id: String,

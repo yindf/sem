@@ -700,7 +700,7 @@ impl SemServer {
         let limit = params.limit.unwrap_or(50);
         let commits = ctx
             .git
-            .get_file_commits(&file_path, limit)
+            .get_file_commits(&file_path, limit, None)
             .map_err(|e| internal_err(format!("Failed to get file history: {}", e)))?;
 
         if commits.is_empty() {

@@ -67,15 +67,155 @@ impl SemanticParserPlugin for CodeParserPlugin {
                 p
             });
 
-            let tree = match parser.parse(content.as_bytes(), None) {
+            // C# preprocessor directives (#if, #else, #elif, #endif, #region,
+            // #endregion, #define, #undef, #pragma) are not supported by
+            // tree-sitter-c-sharp. They cause ERROR nodes that cascade through
+            // the entire parse tree, breaking namespace/class detection and
+            // causing all entities to lose parent_id. Strip them before parsing,
+            // replacing with blank lines to preserve line numbers.
+            let preprocess_content;
+            let parse_content: &str = if config.id == "csharp" {
+                preprocess_content = strip_csharp_preprocessor(content);
+                &preprocess_content
+            } else {
+                content
+            };
+
+            let tree = match parser.parse(parse_content.as_bytes(), None) {
                 Some(t) => t,
                 None => return (Vec::new(), None),
             };
 
-            let entities = extract_entities(&tree, file_path, config, content);
+            // Pass the original content (not preprocessed) to extract_entities
+            // so that entity content spans are correct.
+            let entities = extract_entities(&tree, file_path, config, parse_content);
             (entities, Some(tree))
         })
     }
+}
+
+/// Strip C# preprocessor directives for tree-sitter parsing.
+/// Tree-sitter-c-sharp does not handle #if/#else/#elif/#endif, causing
+/// cascading ERROR nodes. This function keeps only one branch per
+/// conditional block and blanks out the rest, preserving line numbers.
+///
+/// Strategy: keep the `#else` (or last `#elif`) branch as the "active" code,
+/// blank out all other branches and directive lines. For `#if` without `#else`,
+/// keep the `#if` branch. `#region`/`#endregion` are simply blanked.
+fn strip_csharp_preprocessor(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut result: Vec<&str> = lines.clone();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+
+        // Handle #region / #endregion — safe to blank
+        if trimmed.starts_with("#region") || trimmed.starts_with("#endregion")
+            || trimmed.starts_with("#pragma") || trimmed.starts_with("#define")
+            || trimmed.starts_with("#undef")
+            || trimmed.starts_with("#error") || trimmed.starts_with("#warning")
+            || trimmed.starts_with("#line")
+        {
+            result[i] = "";
+            i += 1;
+            continue;
+        }
+
+        if !trimmed.starts_with("#if") {
+            i += 1;
+            continue;
+        }
+
+        // We have a #if block. Find matching #else/#elif/#endif.
+        // Collect branch boundaries: [(start, end, is_last)]
+        let block_start = i;
+        let mut depth = 0;
+        let mut branches: Vec<(usize, usize)> = Vec::new(); // (start_line, end_line_exclusive)
+        let mut branch_start = i + 1;
+        let mut else_line = None;
+        let mut j = i;
+
+        loop {
+            let t = lines[j].trim();
+            if t.starts_with("#if") {
+                if j > i {
+                    // Nested #if — skip its entire block for branch tracking
+                    let mut inner_depth = 1;
+                    j += 1;
+                    while j < lines.len() && inner_depth > 0 {
+                        let it = lines[j].trim();
+                        if it.starts_with("#if") {
+                            inner_depth += 1;
+                        } else if it == "#endif" {
+                            inner_depth -= 1;
+                        }
+                        if inner_depth > 0 { j += 1; }
+                    }
+                    j += 1;
+                    continue;
+                }
+                depth += 1;
+                j += 1;
+                continue;
+            }
+            if depth == 1 {
+                if t.starts_with("#elif") || t == "#else" {
+                    branches.push((branch_start, j));
+                    branch_start = j + 1;
+                    if t == "#else" {
+                        else_line = Some(j);
+                    }
+                }
+                if t == "#endif" {
+                    branches.push((branch_start, j));
+                    break;
+                }
+            }
+            if t == "#endif" {
+                depth -= 1;
+                if depth == 0 {
+                    branches.push((branch_start, j));
+                    break;
+                }
+            }
+            j += 1;
+            if j >= lines.len() { break; }
+        }
+
+        let block_end = j; // line with #endif (or last line)
+
+        // Decide which branch to keep:
+        // - If there's an #else branch, keep that (last branch)
+        // - Otherwise keep the first branch (the #if body)
+        let keep_idx = if else_line.is_some() {
+            branches.len().saturating_sub(1) // keep #else branch
+        } else {
+            0 // keep #if branch when no #else
+        };
+
+        // Blank out the directive lines and non-kept branches
+        for k in block_start..=block_end.min(lines.len() - 1) {
+            let t = lines[k].trim();
+            if t.starts_with("#if") || t.starts_with("#elif") || t == "#else" || t == "#endif" {
+                result[k] = "";
+            }
+        }
+
+        for (bi, (start, end)) in branches.iter().enumerate() {
+            if bi != keep_idx {
+                for k in *start..*end {
+                    if k < lines.len() {
+                        result[k] = "";
+                    }
+                }
+            }
+        }
+
+        i = block_end + 1;
+    }
+
+    result.join("\n")
 }
 
 use crate::parser::registry::detect_ext_from_content;
@@ -1889,5 +2029,152 @@ public class Colors
         assert!(names.contains(&"Red"), "Should find Red, got: {:?}", names);
         // Should also find the static readonly field
         assert!(names.contains(&"Name"), "Should find Name, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_csharp_many_attributes_before_class() {
+        // Reproduce the pattern from uengine2 AccountService.cs:
+        // Many [ConstructorInjector(...)] attributes before the class
+        let mut code = String::from("namespace jj.TKGameService.Runtime\n{\n");
+        for i in 0..25 {
+            code.push_str(&format!("    [ConstructorInjector(typeof(IService{}))]\n", i));
+        }
+        code.push_str("    public partial class AccountService : IAccountService\n    {\n");
+        code.push_str("        public void GetLogoutData() { }\n");
+        code.push_str("    }\n}\n");
+
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(&code, "AccountService.cs");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("C# many attrs: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+
+        assert!(names.contains(&"jj.TKGameService.Runtime"), "Should find namespace, got: {:?}", names);
+        assert!(names.contains(&"AccountService"), "Should find class, got: {:?}", names);
+        assert!(names.contains(&"GetLogoutData"), "Should find method, got: {:?}", names);
+
+        let method = entities.iter().find(|e| e.name == "GetLogoutData").unwrap();
+        assert!(method.parent_id.is_some(), "GetLogoutData should have parent_id");
+    }
+
+    #[test]
+    fn test_csharp_preprocessor_if_else() {
+        // C# preprocessor #if/#else/#endif causes tree-sitter ERROR nodes.
+        // The fix strips preprocessor directives and keeps only one branch.
+        let code = r#"
+namespace MyApp
+{
+    public class Service
+    {
+        public void Method()
+        {
+            int x = 1;
+#if UNITY_IOS
+            x = 2;
+#else
+            x = 3;
+#endif
+            return x;
+        }
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Service.cs");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("C# preprocessor if/else: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+
+        assert!(names.contains(&"MyApp"), "Should find namespace, got: {:?}", names);
+        assert!(names.contains(&"Service"), "Should find class, got: {:?}", names);
+        assert!(names.contains(&"Method"), "Should find method, got: {:?}", names);
+
+        let method = entities.iter().find(|e| e.name == "Method").unwrap();
+        assert!(method.parent_id.is_some(), "Method should have parent_id");
+    }
+
+    #[test]
+    fn test_csharp_preprocessor_if_elif_else() {
+        // Multi-branch preprocessor with #elif
+        let code = r#"
+namespace MyApp
+{
+    public class Config
+    {
+        public string GetPlatform()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            return "android";
+#elif UNITY_IOS && !UNITY_EDITOR
+            return "ios";
+#else
+            return "editor";
+#endif
+        }
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Config.cs");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("C# preprocessor elif: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+
+        assert!(names.contains(&"MyApp"), "Should find namespace, got: {:?}", names);
+        assert!(names.contains(&"Config"), "Should find class, got: {:?}", names);
+        assert!(names.contains(&"GetPlatform"), "Should find method, got: {:?}", names);
+
+        let method = entities.iter().find(|e| e.name == "GetPlatform").unwrap();
+        assert!(method.parent_id.is_some(), "GetPlatform should have parent_id");
+    }
+
+    #[test]
+    fn test_csharp_preprocessor_if_without_else() {
+        // #if without #else — should keep the #if branch
+        let code = r#"
+namespace MyApp
+{
+    public class Service
+    {
+#if DEBUG
+        public void DebugMethod() { }
+#endif
+        public void NormalMethod() { }
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Service.cs");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("C# preprocessor if only: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+
+        assert!(names.contains(&"MyApp"), "Should find namespace, got: {:?}", names);
+        assert!(names.contains(&"Service"), "Should find class, got: {:?}", names);
+        assert!(names.contains(&"NormalMethod"), "Should find method, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_csharp_region_directives() {
+        // #region/#endregion should be stripped without affecting parsing
+        let code = r#"
+namespace MyApp
+{
+    public class Service
+    {
+#region Fields
+        private int x;
+#endregion
+
+#region Methods
+        public void DoWork() { }
+#endregion
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Service.cs");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!("C# regions: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+
+        assert!(names.contains(&"MyApp"), "Should find namespace, got: {:?}", names);
+        assert!(names.contains(&"Service"), "Should find class, got: {:?}", names);
+        assert!(names.contains(&"DoWork"), "Should find method, got: {:?}", names);
     }
 }

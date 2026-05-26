@@ -17,6 +17,7 @@ pub struct LogOptions {
     pub scan_limit: usize,
     pub json: bool,
     pub verbose: bool,
+    pub from_ref: Option<String>,
 }
 
 #[derive(Debug)]
@@ -293,10 +294,10 @@ pub fn log_command(opts: LogOptions) {
                 // by starting the revwalk at the right point, not by skipping.
                 bridge.get_file_commits_from(&current_git_file, &sha, opts.scan_limit)
             } else {
-                bridge.get_file_commits(&current_git_file, opts.scan_limit)
+                bridge.get_file_commits(&current_git_file, opts.scan_limit, opts.from_ref.as_deref())
             }
         } else {
-            bridge.get_file_commits(&current_git_file, opts.scan_limit)
+            bridge.get_file_commits(&current_git_file, opts.scan_limit, opts.from_ref.as_deref())
         };
         let commits = match commits {
             Ok(c) => c,
@@ -1005,23 +1006,69 @@ fn print_inline_diff(before: &str, after: &str) {
     let diff = TextDiff::from_lines(before, after);
     let mut has_changes = false;
 
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            similar::ChangeTag::Delete => {
-                has_changes = true;
-                print!("│    {}", format!("- {}", change).red());
+    for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
+        has_changes = true;
+        println!("│    {}", format!("{}", hunk.header()).dimmed());
+        for op in hunk.ops() {
+            let mut deletes: Vec<String> = Vec::new();
+            let mut inserts: Vec<String> = Vec::new();
+
+            for diff_change in diff.iter_changes(op) {
+                let line = diff_change.value().trim_end_matches('\n');
+                match diff_change.tag() {
+                    similar::ChangeTag::Delete => deletes.push(line.to_string()),
+                    similar::ChangeTag::Insert => inserts.push(line.to_string()),
+                    similar::ChangeTag::Equal => {
+                        println!("│    {}", format!("  {line}").dimmed());
+                    }
+                }
             }
-            similar::ChangeTag::Insert => {
-                has_changes = true;
-                print!("│    {}", format!("+ {}", change).green());
+
+            let paired = deletes.len().min(inserts.len());
+            for i in 0..paired {
+                let (del, ins) = render_log_inline_diff(&deletes[i], &inserts[i]);
+                println!("│    {} {}", "-".red(), del);
+                println!("│    {} {}", "+".green(), ins);
             }
-            similar::ChangeTag::Equal => {} // skip unchanged lines in verbose diff
+            for d in &deletes[paired..] {
+                println!("│    {}", format!("- {d}").red());
+            }
+            for i in &inserts[paired..] {
+                println!("│    {}", format!("+ {i}").green());
+            }
         }
     }
 
     if has_changes {
         println!("│");
     }
+}
+
+/// Word-level inline diff for log output, highlighting changed words.
+fn render_log_inline_diff(old_line: &str, new_line: &str) -> (String, String) {
+    use similar::{ChangeTag, TextDiff};
+
+    let diff = TextDiff::from_words(old_line, new_line);
+    let mut del = String::new();
+    let mut ins = String::new();
+
+    for change in diff.iter_all_changes() {
+        let val = change.value();
+        match change.tag() {
+            ChangeTag::Equal => {
+                del.push_str(&val.dimmed().to_string());
+                ins.push_str(&val.dimmed().to_string());
+            }
+            ChangeTag::Delete => {
+                del.push_str(&val.red().strikethrough().bold().to_string());
+            }
+            ChangeTag::Insert => {
+                ins.push_str(&val.green().bold().to_string());
+            }
+        }
+    }
+
+    (del, ins)
 }
 
 /// Result of matching an entity at a specific commit.
@@ -1426,7 +1473,7 @@ fn walk_predecessor(
     let mut current_git_file = git_file_path.to_string();
 
     loop {
-        let commits = match bridge.get_file_commits(&current_git_file, scan_limit) {
+        let commits = match bridge.get_file_commits(&current_git_file, scan_limit, None) {
             Ok(c) => c,
             Err(_) => break,
         };
@@ -1697,13 +1744,13 @@ fn print_json(
 
 /// Search for an entity in other files changed by a commit.
 /// First tries matching by name, then falls back to structural_hash (handles renames).
-enum FindResult {
+pub enum FindResult {
     Found(String),
     Ambiguous(Vec<String>),
     NotFound,
 }
 
-fn find_entity_file(
+pub fn find_entity_file(
     root: &Path,
     registry: &sem_core::parser::registry::ParserRegistry,
     query: &EntityQuery,

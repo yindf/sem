@@ -2,6 +2,7 @@ pub mod blame;
 pub mod context;
 pub mod diff;
 pub mod entities;
+pub mod entity_diff;
 pub mod graph;
 pub mod impact;
 pub mod log;

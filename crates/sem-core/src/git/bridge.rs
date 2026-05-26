@@ -419,11 +419,56 @@ impl GitBridge {
         Ok(self.read_blob_from_tree(&tree, file_path))
     }
 
-    /// Get commits that modified a specific file, walking history from HEAD.
+    /// List all file paths under a given git ref that match the given extensions.
+    /// Returns paths relative to the repo root.
+    pub fn list_files_at_ref(&self, refspec: &str, exts: &[&str]) -> Result<Vec<String>, GitError> {
+        let tree = self.resolve_tree(refspec)?;
+        let mut result = Vec::new();
+        self.walk_tree(&tree, "", exts, &mut result);
+        Ok(result)
+    }
+
+    fn walk_tree<'a>(
+        &self,
+        tree: &git2::Tree<'a>,
+        prefix: &str,
+        exts: &[&str],
+        result: &mut Vec<String>,
+    ) {
+        for entry in tree.iter() {
+            let name = entry.name().unwrap_or("");
+            let path = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match entry.kind() {
+                Some(git2::ObjectType::Tree) => {
+                    if let Ok(sub) = self.repo.find_tree(entry.id()) {
+                        self.walk_tree(&sub, &path, exts, result);
+                    }
+                }
+                Some(git2::ObjectType::Blob) => {
+                    if exts.iter().any(|e| name.ends_with(e)) {
+                        result.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Get commits that modified a specific file, walking history from HEAD or a given ref.
     /// Returns commits in reverse chronological order (newest first).
-    pub fn get_file_commits(&self, file_path: &str, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
+    pub fn get_file_commits(&self, file_path: &str, limit: usize, from_ref: Option<&str>) -> Result<Vec<CommitInfo>, GitError> {
         let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
+        if let Some(r) = from_ref {
+            let obj = self.repo.revparse_single(r)?;
+            let commit = obj.peel_to_commit()?;
+            revwalk.push(commit.id())?;
+        } else {
+            revwalk.push_head()?;
+        }
         revwalk.set_sorting(git2::Sort::TIME)?;
 
         let mut commits = Vec::new();

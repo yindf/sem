@@ -30,6 +30,11 @@ impl ParserRegistry {
         }
     }
 
+    /// Return all registered file extensions (e.g. [".rs", ".py", ".ts"]).
+    pub fn supported_extensions(&self) -> Vec<String> {
+        self.extension_map.keys().cloned().collect()
+    }
+
     pub fn register(&mut self, plugin: Box<dyn SemanticParserPlugin>) {
         let idx = self.plugins.len();
         for ext in plugin.extensions() {

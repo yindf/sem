@@ -11,6 +11,7 @@ use commands::blame::{blame_command, BlameOptions};
 use commands::context::{context_command, ContextOptions};
 use commands::diff::{diff_command, DiffOptions, OutputFormat};
 use commands::entities::{entities_command, EntitiesOptions};
+use commands::entity_diff::{entity_diff_command, EntityDiffOptions};
 use commands::graph::{graph_command, GraphOptions};
 use commands::impact::{impact_command, ImpactMode, ImpactOptions};
 use commands::log::{log_command, LogOptions};
@@ -182,6 +183,10 @@ enum Commands {
         #[arg()]
         entity: String,
 
+        /// Git ref (branch, commit, tag) to walk history from (default: HEAD)
+        #[arg(long, short = 'r')]
+        r#ref: Option<String>,
+
         /// File containing the entity (auto-detected if omitted)
         #[arg(long)]
         file: Option<String>,
@@ -205,6 +210,32 @@ enum Commands {
         /// Show content diff between versions
         #[arg(long, short = 'v')]
         verbose: bool,
+    },
+    /// Compare an entity's content between two git refs
+    EntityDiff {
+        /// Name of the entity (supports Type.Method(Signature) syntax)
+        #[arg()]
+        entity: String,
+
+        /// First git ref (from)
+        #[arg()]
+        from_ref: String,
+
+        /// Second git ref (to)
+        #[arg()]
+        to_ref: String,
+
+        /// File containing the entity (auto-detected if omitted)
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Show inline content diff
+        #[arg(long, short = 'v')]
+        verbose: bool,
+
+        /// Run as if started in this directory (like git -C)
+        #[arg(short = 'C', long = "cwd")]
+        directory: Option<String>,
     },
     /// List entities under a file or directory path
     Entities {
@@ -424,6 +455,7 @@ fn main() {
         }
         Some(Commands::Log {
             entity,
+            r#ref,
             file,
             limit,
             scan_limit,
@@ -431,16 +463,53 @@ fn main() {
             json,
             verbose,
         }) => {
+            let cwd = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            // Resolve jj revsets
+            let from_ref = if let Some(ref r) = r#ref {
+                let root = std::path::Path::new(&cwd);
+                if sem_core::git::jj::is_jj_repo(root) {
+                    Some(sem_core::git::jj::maybe_resolve_ref(r, root))
+                } else {
+                    Some(r.clone())
+                }
+            } else {
+                None
+            };
+
             log_command(LogOptions {
-                cwd: std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
+                cwd,
                 entity_name: entity,
                 file_path: file,
                 limit,
                 scan_limit,
                 json: resolve_json(format, json),
+                verbose,
+                from_ref,
+            });
+        }
+        Some(Commands::EntityDiff {
+            entity,
+            from_ref,
+            to_ref,
+            file,
+            verbose,
+            directory,
+        }) => {
+            entity_diff_command(EntityDiffOptions {
+                cwd: directory.unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                }),
+                entity,
+                from_ref,
+                to_ref,
+                file,
                 verbose,
             });
         }
