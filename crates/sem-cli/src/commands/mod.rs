@@ -11,9 +11,11 @@ pub mod verify;
 
 use colored::Colorize;
 use sem_core::model::entity::SemanticEntity;
+use sem_core::model::identity::parent_name;
 use sem_core::parser::graph::EntityGraph;
 use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::registry::ParserRegistry;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Create a parser registry with extension mappings loaded from `cwd`.
@@ -26,25 +28,76 @@ pub fn create_registry(cwd: &str) -> ParserRegistry {
     registry
 }
 
-/// Parsed entity query: "Name" or "Name(Signature)".
+/// Parsed entity query: "Name", "Type.Name", "Name(Signature)", "Type.Name(Signature)".
 pub struct EntityQuery {
     pub name: String,
     pub signature: Option<String>,
+    pub scope: Option<Vec<String>>,
+}
+
+/// Parse a potentially scope-qualified name into (scope_parts, entity_name).
+/// Uses `.` as separator throughout (e.g. "Ns.Type.Method").
+/// "FakeTourneyService.Method" -> (Some(["FakeTourneyService"]), "Method")
+/// "Method" -> (None, "Method")
+fn parse_scope_and_name(input: &str) -> (Option<Vec<String>>, String) {
+    if !input.contains('.') {
+        return (None, input.to_string());
+    }
+
+    let parts: Vec<&str> = input.split('.').collect();
+
+    if parts.len() < 2 {
+        return (None, input.to_string());
+    }
+
+    let name = parts.last().unwrap().to_string();
+    let scope: Vec<String> = parts[..parts.len() - 1].iter().map(|s| s.to_string()).collect();
+    (Some(scope), name)
 }
 
 pub fn parse_entity_query(input: &str) -> EntityQuery {
-    if let Some(open) = input.rfind('(') {
+    // Step 1: Extract signature (unchanged logic)
+    let (name_part, signature) = if let Some(open) = input.rfind('(') {
         if input.ends_with(')') && open > 0 {
-            return EntityQuery {
-                name: input[..open].to_string(),
-                signature: Some(input[open..].to_string()),
-            };
+            (input[..open].to_string(), Some(input[open..].to_string()))
+        } else {
+            (input.to_string(), None)
+        }
+    } else {
+        (input.to_string(), None)
+    };
+
+    // Step 2: Parse scope from the name portion
+    let (scope, name) = parse_scope_and_name(&name_part);
+
+    EntityQuery { name, signature, scope }
+}
+
+/// Check if an entity's parent scope matches the given scope parts (suffix-based).
+/// scope_parts like ["FakeTourneyService"] matches entities whose parent_name
+/// is "Internal::FakeTourneyService" or just "FakeTourneyService".
+fn scope_matches(entity: &SemanticEntity, scope: &[String], by_id: &HashMap<&str, &SemanticEntity>) -> bool {
+    if scope.is_empty() {
+        return true;
+    }
+
+    let pname = match parent_name(entity, by_id) {
+        Some(name) => name,
+        None => return false,
+    };
+
+    let parent_parts: Vec<&str> = pname.split('.').collect();
+    if scope.len() > parent_parts.len() {
+        return false;
+    }
+
+    let offset = parent_parts.len() - scope.len();
+    for (i, scope_part) in scope.iter().enumerate() {
+        if parent_parts[offset + i] != scope_part.as_str() {
+            return false;
         }
     }
-    EntityQuery {
-        name: input.to_string(),
-        signature: None,
-    }
+    true
 }
 
 /// Find an entity in the graph by name, ID, or name+signature.
@@ -72,18 +125,93 @@ pub fn find_entity_in_graph<'a>(
 
     let query = parse_entity_query(name);
 
-    let matching: Vec<&SemanticEntity> = if let Some(sig) = &query.signature {
-        all_entities.iter().filter(|e| e.name == query.name && e.signature.as_deref() == Some(sig.as_str())).collect()
-    } else {
-        all_entities.iter().filter(|e| e.name == query.name).collect()
-    };
+    let by_id: HashMap<&str, &SemanticEntity> = all_entities
+        .iter()
+        .map(|e| (e.id.as_str(), e))
+        .collect();
+
+    let matching: Vec<&SemanticEntity> = all_entities
+        .iter()
+        .filter(|e| e.name == query.name)
+        .filter(|e| {
+            query.signature.as_ref().map_or(true, |sig| {
+                e.signature.as_deref() == Some(sig.as_str())
+            })
+        })
+        .filter(|e| {
+            query.scope.as_ref().map_or(true, |scope| {
+                scope_matches(e, scope, &by_id)
+            })
+        })
+        .collect();
 
     if matching.is_empty() {
-        eprintln!("{} Entity '{}' not found", "error:".red().bold(), name);
+        // Check if name matches without scope to give a better error
+        let name_only: Vec<&SemanticEntity> = all_entities
+            .iter()
+            .filter(|e| e.name == query.name)
+            .collect();
+        if !name_only.is_empty() && query.scope.is_some() {
+            eprintln!(
+                "{} Entity '{}' not found in scope '{}'",
+                "error:".red().bold(),
+                query.name,
+                query.scope.as_ref().unwrap().join(".")
+            );
+            let unique_scopes: Vec<String> = name_only
+                .iter()
+                .filter_map(|e| parent_name(e, &by_id))
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            if !unique_scopes.is_empty() {
+                eprintln!("  Available scopes:");
+                for s in &unique_scopes {
+                    eprintln!("    {}.{}", s, query.name);
+                }
+            }
+        } else {
+            eprintln!("{} Entity '{}' not found", "error:".red().bold(), name);
+        }
         std::process::exit(1);
     }
 
-    if query.signature.is_none() && matching.len() > 1 {
+    if query.signature.is_none() && query.scope.is_none() && matching.len() > 1 {
+        // Check if ambiguity is due to different parent types
+        let unique_parents: Vec<Option<&str>> = matching
+            .iter()
+            .map(|e| e.parent_id.as_deref())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        if unique_parents.len() > 1 {
+            // Same method name in different types -- suggest scope qualification
+            eprintln!(
+                "{} Entity '{}' exists in {} types:",
+                "error:".red().bold(),
+                query.name,
+                unique_parents.len()
+            );
+            for e in &matching {
+                let scope_label = parent_name(e, &by_id)
+                    .unwrap_or_else(|| "(top-level)".to_string());
+                let sig = e.signature.as_deref().unwrap_or("");
+                eprintln!(
+                    "  {}.{}{} (L{}:{})",
+                    scope_label, e.name, sig, e.start_line, e.end_line
+                );
+            }
+            let example_scope = parent_name(matching[0], &by_id)
+                .unwrap_or_else(|| "(top-level)".to_string());
+            eprintln!(
+                "\nDisambiguate with scope: {} \"{}.{}\"",
+                command_name, example_scope, query.name
+            );
+            std::process::exit(1);
+        }
+
+        // True overloads (same parent, same name, different signatures)
         eprintln!(
             "{} Entity '{}' has {} overloads:",
             "error:".red().bold(),
@@ -165,7 +293,7 @@ pub fn truncate_str(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_str;
+    use super::{truncate_str, parse_scope_and_name, parse_entity_query, scope_matches};
 
     #[test]
     fn ascii_short_string_unchanged() {
@@ -244,5 +372,194 @@ mod tests {
     fn max_chars_four_triggers_ellipsis() {
         // max_chars == 4, string is longer → take 1 char + "..."
         assert_eq!(truncate_str("hello", 4), "h...");
+    }
+
+    // --- Scope parsing tests ---
+
+    #[test]
+    fn parse_scope_dot_separated() {
+        let (scope, name) = parse_scope_and_name("FakeTourneyService.SendTourneyNewUnSignupReq");
+        assert_eq!(scope, Some(vec!["FakeTourneyService".to_string()]));
+        assert_eq!(name, "SendTourneyNewUnSignupReq");
+    }
+
+    #[test]
+    fn parse_scope_no_scope() {
+        let (scope, name) = parse_scope_and_name("Method");
+        assert_eq!(scope, None);
+        assert_eq!(name, "Method");
+    }
+
+    #[test]
+    fn parse_scope_single_dot_is_name() {
+        // A name with no dot should not be treated as scope
+        let (scope, name) = parse_scope_and_name("Method");
+        assert!(scope.is_none());
+        assert_eq!(name, "Method");
+    }
+
+    #[test]
+    fn entity_query_scope_and_signature() {
+        let q = parse_entity_query("FakeTourneyService.SendTourneyNewUnSignupReq(bool,bool)");
+        assert_eq!(q.name, "SendTourneyNewUnSignupReq");
+        assert_eq!(q.scope, Some(vec!["FakeTourneyService".to_string()]));
+        assert_eq!(q.signature.as_deref(), Some("(bool,bool)"));
+    }
+
+    #[test]
+    fn entity_query_scope_only() {
+        let q = parse_entity_query("FakeTourneyService.SendTourneyNewUnSignupReq");
+        assert_eq!(q.name, "SendTourneyNewUnSignupReq");
+        assert_eq!(q.scope, Some(vec!["FakeTourneyService".to_string()]));
+        assert!(q.signature.is_none());
+    }
+
+    #[test]
+    fn entity_query_backward_compat_name_only() {
+        let q = parse_entity_query("SendTourneyNewUnSignupReq");
+        assert_eq!(q.name, "SendTourneyNewUnSignupReq");
+        assert!(q.scope.is_none());
+        assert!(q.signature.is_none());
+    }
+
+    #[test]
+    fn entity_query_backward_compat_name_and_sig() {
+        let q = parse_entity_query("SendTourneyNewUnSignupReq(uint,uint)");
+        assert_eq!(q.name, "SendTourneyNewUnSignupReq");
+        assert!(q.scope.is_none());
+        assert_eq!(q.signature.as_deref(), Some("(uint,uint)"));
+    }
+
+    #[test]
+    fn parse_scope_dot_separated_multi_level() {
+        let (scope, name) = parse_scope_and_name("jj.Core.Runtime.CoreAppStateMachine.LoadingModuleState.InitModuleAsync");
+        assert_eq!(name, "InitModuleAsync");
+        assert_eq!(scope, Some(vec![
+            "jj".to_string(),
+            "Core".to_string(),
+            "Runtime".to_string(),
+            "CoreAppStateMachine".to_string(),
+            "LoadingModuleState".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn parse_scope_dot_with_signature() {
+        let q = parse_entity_query("jj.Core.Runtime.CoreAppStateMachine.LoadingModuleState.InitModuleAsync()");
+        assert_eq!(q.name, "InitModuleAsync");
+        assert_eq!(q.scope, Some(vec![
+            "jj".to_string(),
+            "Core".to_string(),
+            "Runtime".to_string(),
+            "CoreAppStateMachine".to_string(),
+            "LoadingModuleState".to_string(),
+        ]));
+        assert_eq!(q.signature.as_deref(), Some("()"));
+    }
+
+    // --- scope_matches tests ---
+
+    #[test]
+    fn scope_matches_simple_parent() {
+        use sem_core::model::entity::SemanticEntity;
+        // Parent class
+        let parent = SemanticEntity {
+            id: "file.cs::class::FakeTourneyService".to_string(),
+            file_path: "file.cs".to_string(),
+            entity_type: "class".to_string(),
+            name: "FakeTourneyService".to_string(),
+            signature: None,
+            parent_id: None,
+            content: String::new(),
+            content_hash: String::new(),
+            structural_hash: None,
+            start_line: 1,
+            end_line: 10,
+            metadata: None,
+        };
+        // Method inside the class
+        let method = SemanticEntity {
+            id: "file.cs::file.cs::class::FakeTourneyService::Method".to_string(),
+            file_path: "file.cs".to_string(),
+            entity_type: "method".to_string(),
+            name: "Method".to_string(),
+            signature: None,
+            parent_id: Some("file.cs::class::FakeTourneyService".to_string()),
+            content: String::new(),
+            content_hash: String::new(),
+            structural_hash: None,
+            start_line: 5,
+            end_line: 8,
+            metadata: None,
+        };
+
+        let by_id: std::collections::HashMap<&str, &SemanticEntity> = [
+            (parent.id.as_str(), &parent),
+            (method.id.as_str(), &method),
+        ].into_iter().collect();
+
+        assert!(scope_matches(&method, &["FakeTourneyService".to_string()], &by_id));
+        assert!(!scope_matches(&method, &["OtherClass".to_string()], &by_id));
+        assert!(!scope_matches(&parent, &["FakeTourneyService".to_string()], &by_id)); // parent has no parent_id
+    }
+
+    #[test]
+    fn scope_matches_nested_suffix() {
+        use sem_core::model::entity::SemanticEntity;
+        let ns = SemanticEntity {
+            id: "file.cs::namespace::Internal".to_string(),
+            file_path: "file.cs".to_string(),
+            entity_type: "namespace".to_string(),
+            name: "Internal".to_string(),
+            signature: None,
+            parent_id: None,
+            content: String::new(),
+            content_hash: String::new(),
+            structural_hash: None,
+            start_line: 1,
+            end_line: 2,
+            metadata: None,
+        };
+        let iface = SemanticEntity {
+            id: "file.cs::file.cs::namespace::Internal::ITourneyServiceX".to_string(),
+            file_path: "file.cs".to_string(),
+            entity_type: "interface".to_string(),
+            name: "ITourneyServiceX".to_string(),
+            signature: None,
+            parent_id: Some("file.cs::namespace::Internal".to_string()),
+            content: String::new(),
+            content_hash: String::new(),
+            structural_hash: None,
+            start_line: 3,
+            end_line: 50,
+            metadata: None,
+        };
+        let method = SemanticEntity {
+            id: "file.cs::file.cs::namespace::Internal::ITourneyServiceX::Method".to_string(),
+            file_path: "file.cs".to_string(),
+            entity_type: "method".to_string(),
+            name: "Method".to_string(),
+            signature: None,
+            parent_id: Some("file.cs::file.cs::namespace::Internal::ITourneyServiceX".to_string()),
+            content: String::new(),
+            content_hash: String::new(),
+            structural_hash: None,
+            start_line: 10,
+            end_line: 15,
+            metadata: None,
+        };
+
+        let by_id: std::collections::HashMap<&str, &SemanticEntity> = [
+            (ns.id.as_str(), &ns),
+            (iface.id.as_str(), &iface),
+            (method.id.as_str(), &method),
+        ].into_iter().collect();
+
+        // Suffix match: just the class name
+        assert!(scope_matches(&method, &["ITourneyServiceX".to_string()], &by_id));
+        // Full path match
+        assert!(scope_matches(&method, &["Internal".to_string(), "ITourneyServiceX".to_string()], &by_id));
+        // Wrong suffix
+        assert!(!scope_matches(&method, &["FakeTourneyService".to_string()], &by_id));
     }
 }

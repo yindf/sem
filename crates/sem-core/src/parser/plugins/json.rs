@@ -600,7 +600,7 @@ mod tests {
 }"#;
         let changes = json_diff(before, after);
         assert_eq!(names(&changes), vec![("testTimeout".into(), ChangeType::Modified)]);
-        assert_eq!(changes[0].parent_name.as_deref(), Some("jest::config"));
+        assert_eq!(changes[0].parent_name.as_deref(), Some("jest.config"));
     }
 
     #[test]
@@ -629,7 +629,7 @@ mod tests {
         let changes = json_diff(before, after);
         let jose = find_change(&changes, "jose", ChangeType::Modified);
         // The empty-string key ancestor is dropped from the displayed chain.
-        assert_eq!(jose.parent_name.as_deref(), Some("packages::dependencies"));
+        assert_eq!(jose.parent_name.as_deref(), Some("packages.dependencies"));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -912,7 +912,7 @@ mod tests {
             "{}",
         );
         let timeout = find_change(&changes, "testTimeout", ChangeType::Deleted);
-        assert_eq!(timeout.parent_name.as_deref(), Some("jest::config"));
+        assert_eq!(timeout.parent_name.as_deref(), Some("jest.config"));
         assert!(!changes.iter().any(|c| c.entity_name == "jest" || c.entity_name == "config"),
             "intermediate containers should be suppressed; got: {:?}", names(&changes));
     }

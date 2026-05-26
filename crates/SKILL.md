@@ -26,10 +26,10 @@ Activate sem in these situations:
 ### Code Review / PR Analysis
 
 ```
-1. sem diff --format json          → get structured list of changed entities
+1. sem diff --format markdown       → get structured list of changed entities
 2. For each modified/deleted entity:
    sem impact <entity> --dependents → check who depends on it
-3. sem verify --diff               → catch broken call sites from signature changes
+3. sem verify --diff                → catch broken call sites from signature changes
 ```
 
 ### Refactoring Preparation

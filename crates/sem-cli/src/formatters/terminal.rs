@@ -112,13 +112,17 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
             } else {
                 format!("{}{sig_suffix}", change.entity_name)
             };
+            let display_name = match &change.parent_name {
+                Some(p) => format!("{p}.{base_name}"),
+                None => base_name,
+            };
 
             lines.push(format!(
                 "{}  {} {} {} {}",
                 "│".dimmed(),
                 symbol,
                 type_label.dimmed(),
-                base_name.bold(),
+                display_name.bold(),
                 tag,
             ));
 
@@ -250,7 +254,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                     ));
                 } else if let Some(ref old_parent) = change.old_parent_id {
                     // Intra-file move: extract parent name from entity ID
-                    let parent_name = old_parent.rsplit("::").next().unwrap_or(old_parent);
+                    let parent_name = old_parent.rsplit('.').next().unwrap_or(old_parent);
                     lines.push(format!(
                         "{}    {}",
                         "│".dimmed(),

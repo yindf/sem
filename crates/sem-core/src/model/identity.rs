@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::change::{ChangeType, SemanticChange};
-use super::entity::{SemanticEntity, logical_key, build_entity_id};
+use super::entity::{SemanticEntity, logical_key};
 
-fn parent_name(
+pub fn parent_name(
     entity: &SemanticEntity,
     by_id: &HashMap<&str, &SemanticEntity>,
 ) -> Option<String> {
@@ -35,7 +35,7 @@ fn parent_name(
         return None;
     }
     parts.reverse();
-    Some(parts.join("::"))
+    Some(parts.join("."))
 }
 
 pub struct MatchResult {
@@ -172,7 +172,7 @@ pub fn match_entities(
         .iter()
         .filter(|e| !matched_before.contains(e.id.as_str()))
         .collect();
-    let unmatched_after: Vec<&SemanticEntity> = after
+    let _unmatched_after: Vec<&SemanticEntity> = after
         .iter()
         .filter(|e| !matched_after.contains(e.id.as_str()))
         .collect();
@@ -244,7 +244,7 @@ pub fn match_entities(
                 }
             }
 
-            if let Some((better_before, better_score)) = best_unmatched {
+            if let Some((better_before, _better_score)) = best_unmatched {
                 // Break the Phase 1 match: better_before → after_entity is SignatureChanged
                 // The old before_entity becomes unmatched (will be handled later)
                 matched_before.remove(before_entity.id.as_str());
@@ -719,6 +719,7 @@ fn longest_increasing_subsequence_indices(seq: &[usize]) -> HashSet<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::entity::build_entity_id;
     use crate::utils::hash::content_hash;
 
     fn make_entity(id: &str, name: &str, content: &str, file_path: &str) -> SemanticEntity {
