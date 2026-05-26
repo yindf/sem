@@ -139,28 +139,120 @@ pub fn log_command(opts: LogOptions) {
         std::process::exit(1);
     }
 
-    if query.signature.is_none() {
+    // Parent_id hint for scope-aware entity tracking (set in overload check below)
+    let mut preferred_parent_id: Option<String> = None;
+
+    if query.signature.is_none() || query.scope.is_some() {
         let check_entities = registry.extract_entities(&file_path, &file_content_hint);
-        let overloads: Vec<&SemanticEntity> = check_entities
+        let by_id: std::collections::HashMap<&str, &SemanticEntity> = check_entities
+            .iter()
+            .map(|e| (e.id.as_str(), e))
+            .collect();
+
+        // Filter by name (and scope if specified)
+        let by_name: Vec<&SemanticEntity> = check_entities
             .iter()
             .filter(|e| e.name == query.name)
+            .filter(|e| {
+                query.scope.as_ref().map_or(true, |scope| {
+                    super::scope_matches(e, scope, &by_id)
+                })
+            })
             .collect();
-        if overloads.len() > 1 {
+
+        // When scope is specified, capture the parent_id for disambiguation
+        // if all scope-matched entities share the same parent. This handles
+        // both single entities and multiple overloads within the same scope
+        // (e.g. multiple AddGameUpdate overloads in ITourneyPlusService).
+        if query.scope.is_some() && !by_name.is_empty() {
+            if let Some(ref first_pid) = by_name[0].parent_id {
+                if by_name.iter().all(|e| e.parent_id.as_deref() == Some(first_pid.as_str())) {
+                    preferred_parent_id = Some(first_pid.clone());
+                }
+            }
+        }
+
+        if by_name.is_empty() && query.scope.is_some() {
+            // Scope specified but no match -- check if name exists without scope
+            let without_scope: Vec<&SemanticEntity> = check_entities
+                .iter()
+                .filter(|e| e.name == query.name)
+                .collect();
+            if !without_scope.is_empty() {
+                eprintln!(
+                    "{} Entity '{}' not found in scope '{}'",
+                    "error:".red().bold(),
+                    query.name,
+                    query.scope.as_ref().unwrap().join(".")
+                );
+                let unique_scopes: Vec<String> = without_scope
+                    .iter()
+                    .filter_map(|e| sem_core::model::identity::parent_name(e, &by_id))
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                if !unique_scopes.is_empty() {
+                    eprintln!("  Available scopes:");
+                    for s in &unique_scopes {
+                        eprintln!("    {}.{}", s, query.name);
+                    }
+                }
+                std::process::exit(1);
+            }
+        }
+
+        if by_name.len() > 1 && query.signature.is_none() {
+            // Check if ambiguity is due to different parent types (not true overloads)
+            let unique_parents: Vec<Option<&str>> = by_name
+                .iter()
+                .map(|e| e.parent_id.as_deref())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            if unique_parents.len() > 1 {
+                // Same method name in different types -- suggest scope qualification
+                eprintln!(
+                    "{} Entity '{}' exists in {} types in {}:",
+                    "error:".red().bold(),
+                    opts.entity_name,
+                    unique_parents.len(),
+                    file_path
+                );
+                for e in &by_name {
+                    let scope_label = sem_core::model::identity::parent_name(e, &by_id)
+                        .unwrap_or_else(|| "(top-level)".to_string());
+                    let sig = e.signature.as_deref().unwrap_or("");
+                    eprintln!(
+                        "  {}.{}{} (L{}:{})",
+                        scope_label, e.name, sig, e.start_line, e.end_line
+                    );
+                }
+                let example_scope = sem_core::model::identity::parent_name(by_name[0], &by_id)
+                    .unwrap_or_else(|| "(top-level)".to_string());
+                eprintln!(
+                    "\nDisambiguate with scope: sem log \"{}.{}\"",
+                    example_scope, query.name
+                );
+                std::process::exit(1);
+            }
+
+            // True overloads (same parent, same name, different signatures)
             eprintln!(
                 "{} Entity '{}' has {} overloads in {}:",
                 "error:".red().bold(),
                 opts.entity_name,
-                overloads.len(),
+                by_name.len(),
                 file_path
             );
-            for e in &overloads {
+            for e in &by_name {
                 let sig = e.signature.as_deref().unwrap_or("n/a");
                 eprintln!(
                     "  {} {}{} (L{}:{})",
                     e.entity_type, e.name, sig, e.start_line, e.end_line
                 );
             }
-            let example_sig = overloads[0]
+            let example_sig = by_name[0]
                 .signature
                 .as_deref()
                 .unwrap_or("()");
@@ -259,6 +351,7 @@ pub fn log_command(opts: LogOptions) {
                 prev_content_hash.as_deref(),
                 prev_structural_hash.as_deref(),
                 prev_entity_content.as_deref(),
+                preferred_parent_id.as_deref(),
             );
 
             let date = chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0));
@@ -551,7 +644,7 @@ pub fn log_command(opts: LogOptions) {
                         // different signature, matching parameter count.
                         // This handles the case where the user queries by the NEW signature
                         // but the entity previously had a different signature.
-                        if let Some(pred) = find_predecessor(&commit_entities, &query.name, query.signature.as_deref()) {
+                        if let Some(pred) = find_predecessor(&commit_entities, &query.name, query.signature.as_deref(), preferred_parent_id.as_deref()) {
                             found_at_least_once = true;
                             entity_type = pred.entity_type.clone();
                             chunk.push(LogEntry {
@@ -660,7 +753,7 @@ pub fn log_command(opts: LogOptions) {
             }
         }
         // Cross-file entity move detected inside inner loop — prepend chunk and continue
-        let mut prepend = std::mem::take(&mut chunk);
+        let prepend = std::mem::take(&mut chunk);
         entries.splice(0..0, prepend);
     }
 
@@ -785,7 +878,7 @@ fn print_terminal(
 
     for entry in entries {
         let msg_short = truncate_str(&entry.message, 50);
-        let display_label = compute_display_label(entry);
+        let _display_label = compute_display_label(entry);
         let display_colored = compute_display_label_colored(entry);
 
         println!(
@@ -955,6 +1048,7 @@ fn find_entity_in_commit(
     prev_content_hash: Option<&str>,
     prev_structural_hash: Option<&str>,
     prev_entity_content: Option<&str>,
+    preferred_parent_id: Option<&str>,
 ) -> Option<MatchedEntity> {
     // Build lookup maps for Phase B/C (only needed if we have previous state)
     let content_map: HashMap<&str, &SemanticEntity> = if prev_content_hash.is_some() {
@@ -973,9 +1067,32 @@ fn find_entity_in_commit(
 
     // Phase A: Exact (name, signature) match
     if let Some(sig) = query_signature {
-        if let Some(ent) = entities.iter().find(|e| e.name == query_name && e.signature.as_deref() == Some(sig)) {
+        let matches: Vec<&SemanticEntity> = entities.iter()
+            .filter(|e| e.name == query_name && e.signature.as_deref() == Some(sig))
+            .collect();
+        if matches.len() == 1 {
             return Some(MatchedEntity {
-                entity: ent.clone(),
+                entity: matches[0].clone(),
+                match_type: None,
+                old_name: None,
+                old_signature: None,
+            });
+        }
+        // Multiple matches with same name+signature — prefer by parent_id
+        if !matches.is_empty() {
+            if let Some(pid) = preferred_parent_id {
+                if let Some(ent) = matches.iter().find(|e| e.parent_id.as_deref() == Some(pid)) {
+                    return Some(MatchedEntity {
+                        entity: (*ent).clone(),
+                        match_type: None,
+                        old_name: None,
+                        old_signature: None,
+                    });
+                }
+            }
+            // Fallback: first match
+            return Some(MatchedEntity {
+                entity: matches[0].clone(),
                 match_type: None,
                 old_name: None,
                 old_signature: None,
@@ -1136,10 +1253,11 @@ fn find_predecessor<'a>(
     entities: &'a [SemanticEntity],
     query_name: &str,
     query_signature: Option<&str>,
+    preferred_parent_id: Option<&str>,
 ) -> Option<&'a SemanticEntity> {
     let query_param_count = query_signature.map(|s| s.matches(',').count() + 1);
 
-    let candidates: Vec<&SemanticEntity> = entities
+    let mut candidates: Vec<&SemanticEntity> = entities
         .iter()
         .filter(|e| e.name == query_name && e.signature.is_some() && e.signature.as_deref() != query_signature)
         .collect();
@@ -1148,7 +1266,16 @@ fn find_predecessor<'a>(
         return None;
     }
 
-    // Prefer candidate with matching parameter count
+    // Filter by parent_id if scope was specified
+    if let Some(pid) = preferred_parent_id {
+        candidates.retain(|e| e.parent_id.as_deref() == Some(pid));
+        if candidates.is_empty() {
+            return None;
+        }
+    }
+
+    // Only match candidates with the same parameter count.
+    // Different parameter counts indicate different overloads, not a signature change.
     if let Some(target_count) = query_param_count {
         if let Some(best) = candidates.iter().find(|e| {
             e.signature
@@ -1160,7 +1287,8 @@ fn find_predecessor<'a>(
         }
     }
 
-    candidates.into_iter().next()
+    // No candidate with matching parameter count — don't match across overloads
+    None
 }
 
 /// Cross-file entity search with overload awareness.
@@ -1284,7 +1412,7 @@ fn walk_predecessor(
     registry: &ParserRegistry,
     git_file_path: &str,
     predecessor: &SemanticEntity,
-    current_entity: &SemanticEntity,
+    _current_entity: &SemanticEntity,
     scan_limit: usize,
 ) -> (Vec<LogEntry>, usize) {
     let mut entries: Vec<LogEntry> = Vec::new();
@@ -1330,6 +1458,7 @@ fn walk_predecessor(
                 prev_content_hash.as_deref(),
                 prev_structural_hash.as_deref(),
                 prev_entity_content.as_deref(),
+                None,
             );
 
             let date = chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0));
@@ -1583,7 +1712,7 @@ fn find_entity_file(
     let files = super::graph::find_supported_files_public(root, registry, &ext_filter);
     let mut found_in: Vec<String> = Vec::new();
 
-    // Pass 1: Try exact (name, signature) match
+    // Pass 1: Try exact (name, signature, scope) match
     for file_path in &files {
         let full_path = root.join(file_path);
         let content = match std::fs::read_to_string(&full_path) {
@@ -1592,11 +1721,24 @@ fn find_entity_file(
         };
 
         let entities = registry.extract_entities(file_path, &content);
-        let matches: Vec<_> = if let Some(sig) = &query.signature {
-            entities.iter().filter(|e| e.name == query.name && e.signature.as_deref() == Some(sig.as_str())).collect()
-        } else {
-            entities.iter().filter(|e| e.name == query.name).collect()
-        };
+        let by_id: std::collections::HashMap<&str, &SemanticEntity> = entities
+            .iter()
+            .map(|e| (e.id.as_str(), e))
+            .collect();
+        let matches: Vec<_> = entities
+            .iter()
+            .filter(|e| e.name == query.name)
+            .filter(|e| {
+                query.signature.as_ref().map_or(true, |sig| {
+                    e.signature.as_deref() == Some(sig.as_str())
+                })
+            })
+            .filter(|e| {
+                query.scope.as_ref().map_or(true, |scope| {
+                    super::scope_matches(e, scope, &by_id)
+                })
+            })
+            .collect();
         if !matches.is_empty() {
             found_in.push(file_path.clone());
         }
@@ -1614,7 +1756,20 @@ fn find_entity_file(
             };
 
             let entities = registry.extract_entities(file_path, &content);
-            if entities.iter().any(|e| e.name == query.name) {
+            let by_id: std::collections::HashMap<&str, &SemanticEntity> = entities
+                .iter()
+                .map(|e| (e.id.as_str(), e))
+                .collect();
+            let matches: Vec<_> = entities
+                .iter()
+                .filter(|e| e.name == query.name)
+                .filter(|e| {
+                    query.scope.as_ref().map_or(true, |scope| {
+                        super::scope_matches(e, scope, &by_id)
+                    })
+                })
+                .collect();
+            if !matches.is_empty() {
                 found_in.push(file_path.clone());
             }
         }
@@ -1735,7 +1890,7 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "Process", Some("(int)"),
             "Process", Some("(int)"),
-            None, None, None,
+            None, None, None, None,
         );
         assert!(result.is_some());
         let m = result.unwrap();
@@ -1751,7 +1906,7 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "Process", None,
             "Process", None,
-            None, None, None,
+            None, None, None, None,
         );
         assert!(result.is_some());
         assert_eq!(result.unwrap().entity.content_hash, "hash_a");
@@ -1767,7 +1922,7 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "Process", None,
             "Process", None,
-            Some("hash_b"), None, None,
+            Some("hash_b"), None, None, None,
         );
         assert!(result.is_some());
         assert_eq!(result.unwrap().entity.content_hash, "hash_b");
@@ -1782,7 +1937,7 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "Process", None,
             "Process", None,
-            None, Some("struct_b"), None,
+            None, Some("struct_b"), None, None,
         );
         assert!(result.is_some());
         assert_eq!(result.unwrap().entity.content_hash, "hash_b");
@@ -1797,7 +1952,7 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "Process", Some("(int)"),
             "Process", Some("(int)"),
-            Some("hash_a"), None, None,
+            Some("hash_a"), None, None, None,
         );
         assert!(result.is_some());
         let m = result.unwrap();
@@ -1814,7 +1969,7 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "Process", Some("(int)"),
             "Process", Some("(int)"),
-            None, Some("struct_a"), None,
+            None, Some("struct_a"), None, None,
         );
         assert!(result.is_some());
         let m = result.unwrap();
@@ -1849,7 +2004,7 @@ mod tests {
             &entities, "GetDownPackageCount", Some("(bool,bool,bool)"),
             "GetDownPackageCount", Some("(bool,bool,bool)"),
             Some("hash_bool"), Some("struct_bool"),
-            Some(prev_content),
+            Some(prev_content), None,
         );
         assert!(result.is_some());
         let m = result.unwrap();
@@ -1867,7 +2022,7 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "Process", Some("(int)"),
             "Process", Some("(int)"),
-            Some("hash_a"), None, None,
+            Some("hash_a"), None, None, None,
         );
         assert!(result.is_some());
         let m = result.unwrap();
@@ -1884,7 +2039,7 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "Process", Some("(int)"),
             "Process", Some("(int)"),
-            None, Some("struct_a"), None,
+            None, Some("struct_a"), None, None,
         );
         assert!(result.is_some());
         let m = result.unwrap();
@@ -1900,7 +2055,7 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "Process", Some("(int)"),
             "Process", Some("(int)"),
-            Some("hash_z"), None, None,
+            Some("hash_z"), None, None, None,
         );
         assert!(result.is_none());
     }
@@ -1916,7 +2071,7 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "Process", Some("(int)"),
             "Process", Some("(int)"),
-            None, Some("struct_a"), None,
+            None, Some("struct_a"), None, None,
         );
         assert!(result.is_some());
         let m = result.unwrap();
@@ -1953,7 +2108,7 @@ mod tests {
             &entities, "RegisterUpdateInterruptHandler", Some("(Action<GainInterruptReason>)"),
             "RegisterUpdateInterruptHandler", Some("(Action<GainInterruptReason>)"),
             None, None,
-            Some(prev_content),
+            Some(prev_content), None,
         );
         // Must NOT match: signatures are completely different
         assert!(result.is_none(), "should not rename-match entities with different signatures");
@@ -1984,7 +2139,7 @@ mod tests {
             &entities, "GetDownPackageCount", Some("(bool,bool,bool,int)"),
             "GetDownPackageCount", Some("(bool,bool,bool,int)"),
             None, None,
-            Some(prev_content),
+            Some(prev_content), None,
         );
         assert!(result.is_some());
         let m = result.unwrap();
@@ -2019,7 +2174,7 @@ mod tests {
             &entities, "Foo", Some("(int)"),
             "Foo", Some("(int)"),
             None, None,
-            Some(prev_content),
+            Some(prev_content), None,
         );
         assert!(result.is_none(), "should not rename-match with different signatures");
     }
@@ -2095,7 +2250,7 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "ResumeAllDown", Some("()"),
             "ResumeAllDown", None,
-            None, None, None,
+            None, None, None, None,
         );
         assert!(result.is_some());
         let m = result.unwrap();
@@ -2112,10 +2267,134 @@ mod tests {
         let result = find_entity_in_commit(
             &entities, "ResumeAllDown", Some("(bool)"),
             "ResumeAllDown", Some("(bool)"),
-            None, None, None,
+            None, None, None, None,
         );
         assert!(result.is_some());
         assert_eq!(result.unwrap().entity.signature.as_deref(), Some("(bool)"));
+    }
+
+    #[test]
+    fn test_find_entity_disambiguates_by_parent_id() {
+        // Same method name and signature in two different types (interface + class).
+        // preferred_parent_id should select the correct one.
+        let interface_parent = "file.cs::interface::ITourneyPlusService";
+        let class_parent = "file.cs::class::FakeTourneyPlusService";
+        let entities = vec![
+            SemanticEntity {
+                id: format!("file.cs::method::AddGameUpdate(List<int>,bool)::iface"),
+                file_path: "file.cs".to_string(),
+                entity_type: "method".to_string(),
+                name: "AddGameUpdate".to_string(),
+                signature: Some("(List<int>,bool)".to_string()),
+                parent_id: Some(interface_parent.to_string()),
+                content: "void AddGameUpdate(List<int> ids, bool flag) { }".to_string(),
+                content_hash: "hash_iface".to_string(),
+                structural_hash: None,
+                start_line: 10,
+                end_line: 10,
+                metadata: None,
+            },
+            SemanticEntity {
+                id: format!("file.cs::method::AddGameUpdate(List<int>,bool)::class"),
+                file_path: "file.cs".to_string(),
+                entity_type: "method".to_string(),
+                name: "AddGameUpdate".to_string(),
+                signature: Some("(List<int>,bool)".to_string()),
+                parent_id: Some(class_parent.to_string()),
+                content: "void AddGameUpdate(List<int> ids, bool flag) { /* impl */ }".to_string(),
+                content_hash: "hash_class".to_string(),
+                structural_hash: None,
+                start_line: 30,
+                end_line: 30,
+                metadata: None,
+            },
+        ];
+
+        // Query for the interface method
+        let result = find_entity_in_commit(
+            &entities,
+            "AddGameUpdate", Some("(List<int>,bool)"),
+            "AddGameUpdate", Some("(List<int>,bool)"),
+            None, None, None,
+            Some(interface_parent),
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().entity.parent_id.as_deref(), Some(interface_parent));
+
+        // Query for the class method
+        let result = find_entity_in_commit(
+            &entities,
+            "AddGameUpdate", Some("(List<int>,bool)"),
+            "AddGameUpdate", Some("(List<int>,bool)"),
+            None, None, None,
+            Some(class_parent),
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().entity.parent_id.as_deref(), Some(class_parent));
+    }
+
+    // --- find_predecessor tests ---
+
+    fn make_entity_with_pid(name: &str, signature: Option<&str>, content_hash: &str, parent_id: Option<&str>) -> SemanticEntity {
+        SemanticEntity {
+            id: format!("file.cs::method::{}{}", name, signature.unwrap_or("")),
+            file_path: "file.cs".to_string(),
+            entity_type: "method".to_string(),
+            name: name.to_string(),
+            signature: signature.map(|s| s.to_string()),
+            parent_id: parent_id.map(|s| s.to_string()),
+            content: String::new(),
+            content_hash: content_hash.to_string(),
+            structural_hash: None,
+            start_line: 1,
+            end_line: 10,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_find_predecessor_no_match_across_param_count() {
+        // AddGameUpdate(int) should NOT be a predecessor for AddGameUpdate(List<int>,bool)
+        // because they have different parameter counts — they're different overloads.
+        let entities = vec![
+            make_entity_with_pid("AddGameUpdate", Some("(int)"), "hash1", Some("file.cs::interface::ISvc")),
+        ];
+        // Query sig has 2 params, candidate has 1 param → no match
+        assert!(find_predecessor(&entities, "AddGameUpdate", Some("(List<int>,bool)"), None).is_none());
+    }
+
+    #[test]
+    fn test_find_predecessor_matches_same_param_count() {
+        // AddGameUpdate(int,bool) → AddGameUpdate(List<int>,bool): same param count, valid signature change
+        let entities = vec![
+            make_entity_with_pid("AddGameUpdate", Some("(int,bool)"), "hash1", Some("file.cs::interface::ISvc")),
+        ];
+        let result = find_predecessor(&entities, "AddGameUpdate", Some("(List<int>,bool)"), None);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().signature.as_deref(), Some("(int,bool)"));
+    }
+
+    #[test]
+    fn test_find_predecessor_filters_by_parent_id() {
+        // Two entities with same name/sig but different parent — should only match in the right scope
+        let entities = vec![
+            make_entity_with_pid("AddGameUpdate", Some("(int,bool)"), "hash1", Some("file.cs::interface::ISvc")),
+            make_entity_with_pid("AddGameUpdate", Some("(int,bool)"), "hash2", Some("file.cs::class::FakeSvc")),
+        ];
+        // Only match entity in ISvc
+        let result = find_predecessor(&entities, "AddGameUpdate", Some("(List<int>,bool)"), Some("file.cs::interface::ISvc"));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().parent_id.as_deref(), Some("file.cs::interface::ISvc"));
+    }
+
+    #[test]
+    fn test_find_predecessor_returns_none_when_parent_excludes_all() {
+        // Candidate exists but in wrong parent — should return None
+        let entities = vec![
+            make_entity_with_pid("AddGameUpdate", Some("(int,bool)"), "hash1", Some("file.cs::class::FakeSvc")),
+        ];
+        let result = find_predecessor(&entities, "AddGameUpdate", Some("(List<int>,bool)"), Some("file.cs::interface::ISvc"));
+        assert!(result.is_none());
     }
 
     // --- Cross-file move detection integration tests ---
