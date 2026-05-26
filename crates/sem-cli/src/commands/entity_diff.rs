@@ -268,31 +268,6 @@ fn find_entity<'a>(
     ))
 }
 
-/// Try to find entity with scope, then fall back to name+signature only.
-/// This handles cases where parent_id is missing at an older ref (parser
-/// didn't detect the parent class, e.g. C# partial classes).
-fn find_with_scope_fallback<'a>(
-    entities: &'a [SemanticEntity],
-    query: &super::EntityQuery,
-) -> Option<&'a SemanticEntity> {
-    // Try with scope first
-    if let Ok(ent) = find_entity(entities, query) {
-        return Some(ent);
-    }
-    // Fallback: retry without scope (parent may not have been detected)
-    if query.scope.is_some() {
-        let relaxed = super::EntityQuery {
-            name: query.name.clone(),
-            signature: query.signature.clone(),
-            scope: None,
-        };
-        if let Ok(ent) = find_entity(entities, &relaxed) {
-            return Some(ent);
-        }
-    }
-    None
-}
-
 /// Resolve an entity at a given ref. If the primary file doesn't exist at that ref
 /// (entity moved), search candidate files using git diff and scope-based heuristics.
 /// Returns (entity, file_path) or None if not found.
@@ -308,7 +283,7 @@ fn resolve_entity_at_ref(
     let primary_result = bridge.read_file_at_ref(git_ref, primary_file);
     if let Ok(Some(content)) = primary_result {
         let entities = registry.extract_entities(primary_file, &content);
-        if let Some(r) = find_with_scope_fallback(&entities, query) {
+        if let Ok(r) = find_entity(&entities, query) {
             return Some((r.clone(), primary_file.to_string()));
         }
     }
@@ -319,7 +294,7 @@ fn resolve_entity_at_ref(
     for file_path in &candidates {
         if let Ok(Some(content)) = bridge.read_file_at_ref(git_ref, file_path) {
             let entities = registry.extract_entities(file_path, &content);
-            if let Some(r) = find_with_scope_fallback(&entities, query) {
+            if let Ok(r) = find_entity(&entities, query) {
                 return Some((r.clone(), file_path.clone()));
             }
         }
