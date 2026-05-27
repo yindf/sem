@@ -71,8 +71,8 @@ pub fn entity_diff_command(opts: EntityDiffOptions) {
     let to_resolved = resolve_entity_at_ref(&bridge, &registry, &query, &to_ref, &git_file, &from_ref);
 
     let (from_ent, from_file) = match from_resolved {
-        Some(r) => r,
-        None => {
+        Ok(Some(r)) => r,
+        Ok(None) => {
             eprintln!(
                 "{} Entity '{}' not found at ref '{}'",
                 "error:".red().bold(),
@@ -81,17 +81,25 @@ pub fn entity_diff_command(opts: EntityDiffOptions) {
             );
             std::process::exit(1);
         }
+        Err(msg) => {
+            eprintln!("{} {}", "error:".red().bold(), msg);
+            std::process::exit(1);
+        }
     };
 
     let (to_ent, to_file) = match to_resolved {
-        Some(r) => r,
-        None => {
+        Ok(Some(r)) => r,
+        Ok(None) => {
             eprintln!(
                 "{} Entity '{}' not found at ref '{}'",
                 "error:".red().bold(),
                 opts.entity,
                 to_ref
             );
+            std::process::exit(1);
+        }
+        Err(msg) => {
+            eprintln!("{} {}", "error:".red().bold(), msg);
             std::process::exit(1);
         }
     };
@@ -255,22 +263,33 @@ fn find_entity<'a>(
         ));
     }
 
-    // True overloads
-    let sigs: Vec<String> = matching
+    // True overloads — show each overload with a copy-pasteable command
+    let scope_prefix = query.scope.as_ref().map_or(String::new(), |s| s.join(".") + ".");
+    let overload_list: Vec<String> = matching
         .iter()
-        .map(|e| e.signature.as_deref().unwrap_or("()").to_string())
+        .map(|e| {
+            let sig = e.signature.as_deref().unwrap_or("()");
+            let scope_label = parent_name(e, &by_id).unwrap_or_else(|| "(top-level)".to_string());
+            format!(
+                "  {}.{}{} (L{}:{})",
+                scope_label, e.name, sig, e.start_line, e.end_line
+            )
+        })
         .collect();
     Err(format!(
-        "Entity '{}' has {} overloads: {}. Specify the signature to disambiguate",
+        "Entity '{}' has {} overloads:\n{}\n\nSpecify the signature, e.g.:\n  sem entity-diff \"{}{}{}\" <from> <to>",
         query.name,
         matching.len(),
-        sigs.join(", ")
+        overload_list.join("\n"),
+        scope_prefix,
+        query.name,
+        matching[0].signature.as_deref().unwrap_or("()")
     ))
 }
 
 /// Resolve an entity at a given ref. If the primary file doesn't exist at that ref
 /// (entity moved), search candidate files using git diff and scope-based heuristics.
-/// Returns (entity, file_path) or None if not found.
+/// Returns Ok(entity, file_path), Err(disambiguation message), or None if not found.
 fn resolve_entity_at_ref(
     bridge: &GitBridge,
     registry: &sem_core::parser::registry::ParserRegistry,
@@ -278,13 +297,14 @@ fn resolve_entity_at_ref(
     git_ref: &str,
     primary_file: &str,
     other_ref: &str,
-) -> Option<(SemanticEntity, String)> {
+) -> Result<Option<(SemanticEntity, String)>, String> {
     // Try the primary file first
     let primary_result = bridge.read_file_at_ref(git_ref, primary_file);
     if let Ok(Some(content)) = primary_result {
         let entities = registry.extract_entities(primary_file, &content);
-        if let Ok(r) = find_entity(&entities, query) {
-            return Some((r.clone(), primary_file.to_string()));
+        match find_entity(&entities, query) {
+            Ok(r) => return Ok(Some((r.clone(), primary_file.to_string()))),
+            Err(msg) => return Err(msg),
         }
     }
 
@@ -294,13 +314,14 @@ fn resolve_entity_at_ref(
     for file_path in &candidates {
         if let Ok(Some(content)) = bridge.read_file_at_ref(git_ref, file_path) {
             let entities = registry.extract_entities(file_path, &content);
-            if let Ok(r) = find_entity(&entities, query) {
-                return Some((r.clone(), file_path.clone()));
+            match find_entity(&entities, query) {
+                Ok(r) => return Ok(Some((r.clone(), file_path.clone()))),
+                Err(msg) => return Err(msg),
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Collect candidate files where the entity might exist at a given ref.
