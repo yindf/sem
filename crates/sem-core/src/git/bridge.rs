@@ -428,6 +428,63 @@ impl GitBridge {
         Ok(result)
     }
 
+    /// Search all blobs at a given ref for a text string.
+    /// Returns (file_path, content) pairs for blobs that contain `needle`
+    /// and have a supported extension.
+    /// Uses git's packfile (mmap) — much faster than per-file open/read/close.
+    pub fn grep_blobs_at_ref(
+        &self,
+        refspec: &str,
+        needle: &str,
+        exts: &[&str],
+    ) -> Result<Vec<(String, String)>, GitError> {
+        let tree = self.resolve_tree(refspec)?;
+        let mut result = Vec::new();
+        self.grep_tree(&tree, "", needle, exts, &mut result);
+        Ok(result)
+    }
+
+    fn grep_tree(
+        &self,
+        tree: &git2::Tree,
+        prefix: &str,
+        needle: &str,
+        exts: &[&str],
+        result: &mut Vec<(String, String)>,
+    ) {
+        for entry in tree.iter() {
+            let name = entry.name().unwrap_or("");
+            let path = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match entry.kind() {
+                Some(git2::ObjectType::Tree) => {
+                    if let Ok(sub) = self.repo.find_tree(entry.id()) {
+                        self.grep_tree(&sub, &path, needle, exts, result);
+                    }
+                }
+                Some(git2::ObjectType::Blob) => {
+                    if !exts.iter().any(|e| name.ends_with(e)) {
+                        continue;
+                    }
+                    if let Ok(blob) = self.repo.find_blob(entry.id()) {
+                        if let Ok(content) = std::str::from_utf8(blob.content()) {
+                            if content.contains(needle) {
+                                result.push((
+                                    path,
+                                    Self::normalize_line_endings(content.to_string()),
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn walk_tree<'a>(
         &self,
         tree: &git2::Tree<'a>,

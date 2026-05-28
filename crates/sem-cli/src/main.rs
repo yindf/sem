@@ -233,6 +233,10 @@ enum Commands {
         #[arg(long, short = 'v')]
         verbose: bool,
 
+        /// Show internal timing profile
+        #[arg(long, hide = true)]
+        profile: bool,
+
         /// Run as if started in this directory (like git -C)
         #[arg(short = 'C', long = "cwd")]
         directory: Option<String>,
@@ -497,6 +501,7 @@ fn main() {
             to_ref,
             file,
             verbose,
+            profile,
             directory,
         }) => {
             entity_diff_command(EntityDiffOptions {
@@ -511,6 +516,7 @@ fn main() {
                 to_ref,
                 file,
                 verbose,
+                profile,
             });
         }
         Some(Commands::Entities { path, format, json }) => {

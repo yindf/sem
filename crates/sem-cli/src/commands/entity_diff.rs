@@ -7,6 +7,7 @@ use sem_core::parser::differ::DiffResult;
 use crate::formatters::terminal;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 pub struct EntityDiffOptions {
     pub cwd: String,
@@ -15,10 +16,13 @@ pub struct EntityDiffOptions {
     pub to_ref: String,
     pub file: Option<String>,
     pub verbose: bool,
+    pub profile: bool,
 }
 
 pub fn entity_diff_command(opts: EntityDiffOptions) {
+    let total_start = Instant::now();
     let root = Path::new(&opts.cwd);
+    let t0 = Instant::now();
     let registry = super::create_registry(&opts.cwd);
     let query = super::parse_entity_query(&opts.entity);
 
@@ -37,12 +41,14 @@ pub fn entity_diff_command(opts: EntityDiffOptions) {
             std::process::exit(1);
         }
     };
+    let registry_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     // Auto-detect file if not provided
+    let t1 = Instant::now();
     let git_file = if let Some(ref f) = opts.file {
         f.replace('\\', "/")
     } else {
-        match super::log::find_entity_file(root, &registry, &query) {
+        match super::log::find_entity_file(root, &registry, &query, Some(&bridge)) {
             super::log::FindResult::Found(fp) => fp,
             super::log::FindResult::Ambiguous(files) => {
                 eprintln!(
@@ -65,10 +71,37 @@ pub fn entity_diff_command(opts: EntityDiffOptions) {
             }
         }
     };
+    let find_file_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+    // If query has no scope, discover parent name from the file on disk
+    // so resolve_entity_at_ref can use scope heuristic instead of git diff
+    let effective_scope = if query.scope.is_none() {
+        let file_on_disk = root.join(&git_file);
+        if let Ok(content) = std::fs::read_to_string(&file_on_disk) {
+            let entities = registry.extract_entities(&git_file, &content);
+            let by_id: HashMap<&str, &SemanticEntity> = entities.iter()
+                .map(|e| (e.id.as_str(), e)).collect();
+            entities.iter()
+                .filter(|e| e.name == query.name)
+                .filter(|e| {
+                    query.signature.as_ref().map_or(true, |sig| {
+                        e.signature.as_deref() == Some(sig.as_str())
+                    })
+                })
+                .find_map(|e| parent_name(e, &by_id))
+                .map(|pn| pn.split('.').map(|s| s.to_string()).collect())
+        } else {
+            None
+        }
+    } else {
+        query.scope.clone()
+    };
 
     // Resolve entity at each ref (handles cross-file moves)
-    let from_resolved = resolve_entity_at_ref(&bridge, &registry, &query, &from_ref, &git_file, &to_ref);
-    let to_resolved = resolve_entity_at_ref(&bridge, &registry, &query, &to_ref, &git_file, &from_ref);
+    let t2 = Instant::now();
+    let from_resolved = resolve_entity_at_ref(&bridge, &registry, &query, &effective_scope, &from_ref, &git_file, &to_ref);
+    let to_resolved = resolve_entity_at_ref(&bridge, &registry, &query, &effective_scope, &to_ref, &git_file, &from_ref);
+    let resolve_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
     let (from_ent, from_file) = match from_resolved {
         Ok(Some(r)) => r,
@@ -180,10 +213,26 @@ pub fn entity_diff_command(opts: EntityDiffOptions) {
         total_entities_after: 1,
     };
 
+    let t3 = Instant::now();
     println!(
         "{}",
         terminal::format_terminal(&result, opts.verbose)
     );
+    let format_ms = t3.elapsed().as_secs_f64() * 1000.0;
+
+    if opts.profile {
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!();
+        eprintln!("\x1b[2m── Profile ──────────────────────────────────\x1b[0m");
+        eprintln!("\x1b[2m  registry init        {registry_ms:>8.2}ms\x1b[0m");
+        eprintln!("\x1b[2m  find_entity_file     {find_file_ms:>8.2}ms\x1b[0m");
+        eprintln!("\x1b[2m  resolve refs         {resolve_ms:>8.2}ms\x1b[0m");
+        eprintln!("\x1b[2m  format output        {format_ms:>8.2}ms\x1b[0m");
+        eprintln!("\x1b[2m  ─────────────────────────────────────────────\x1b[0m");
+        eprintln!("\x1b[2m  total                {total_ms:>8.2}ms\x1b[0m");
+        eprintln!("\x1b[2m  file: {}\x1b[0m", git_file);
+        eprintln!("\x1b[2m─────────────────────────────────────────────\x1b[0m");
+    }
 }
 
 /// Find a single entity matching the query, with disambiguation errors.
@@ -288,47 +337,107 @@ fn find_entity<'a>(
 }
 
 /// Resolve an entity at a given ref. If the primary file doesn't exist at that ref
-/// (entity moved), search candidate files using git diff and scope-based heuristics.
+/// (entity moved), search candidate files using scope-based heuristics first (cheap),
+/// then git diff (expensive) as fallback.
 /// Returns Ok(entity, file_path), Err(disambiguation message), or None if not found.
 fn resolve_entity_at_ref(
     bridge: &GitBridge,
     registry: &sem_core::parser::registry::ParserRegistry,
     query: &super::EntityQuery,
+    effective_scope: &Option<Vec<String>>,
     git_ref: &str,
     primary_file: &str,
     other_ref: &str,
 ) -> Result<Option<(SemanticEntity, String)>, String> {
-    // Try the primary file first
-    let primary_result = bridge.read_file_at_ref(git_ref, primary_file);
-    if let Ok(Some(content)) = primary_result {
+    // Try the primary file first — only exact matches; any miss falls through to candidates
+    if let Ok(Some(content)) = bridge.read_file_at_ref(git_ref, primary_file) {
         let entities = registry.extract_entities(primary_file, &content);
-        match find_entity(&entities, query) {
-            Ok(r) => return Ok(Some((r.clone(), primary_file.to_string()))),
-            Err(msg) => return Err(msg),
+        if let Ok(r) = find_entity(&entities, query) {
+            return Ok(Some((r.clone(), primary_file.to_string())));
         }
     }
 
-    // Primary file not found or entity not in it — find candidate files
-    let candidates = collect_candidate_files(bridge, query, primary_file, git_ref, other_ref);
+    // Strategy 1 (cheap): scope-based heuristic candidates
+    let scope_candidates = scope_candidate_files(effective_scope, primary_file);
+    if let Some(result) = try_candidates(bridge, registry, query, git_ref, &scope_candidates) {
+        return result;
+    }
 
-    for file_path in &candidates {
-        if let Ok(Some(content)) = bridge.read_file_at_ref(git_ref, file_path) {
-            let entities = registry.extract_entities(file_path, &content);
-            match find_entity(&entities, query) {
-                Ok(r) => return Ok(Some((r.clone(), file_path.clone()))),
-                Err(msg) => return Err(msg),
-            }
-        }
+    // Strategy 2 (expensive): git diff between the two refs
+    let git_candidates = git_diff_candidate_files(bridge, primary_file, git_ref, other_ref);
+    if let Some(result) = try_candidates(bridge, registry, query, git_ref, &git_candidates) {
+        return result;
     }
 
     Ok(None)
 }
 
-/// Collect candidate files where the entity might exist at a given ref.
-/// Uses git diff to find renamed/moved files and scope-based path heuristics.
-fn collect_candidate_files(
+/// Try a list of candidate files, returning the first exact match.
+/// Tracks the best error if entity name exists but no exact match.
+fn try_candidates(
     bridge: &GitBridge,
+    registry: &sem_core::parser::registry::ParserRegistry,
     query: &super::EntityQuery,
+    git_ref: &str,
+    candidates: &[String],
+) -> Option<Result<Option<(SemanticEntity, String)>, String>> {
+    let mut name_found_error: Option<String> = None;
+
+    for file_path in candidates {
+        if let Ok(Some(content)) = bridge.read_file_at_ref(git_ref, file_path) {
+            let entities = registry.extract_entities(file_path, &content);
+            match find_entity(&entities, query) {
+                Ok(r) => return Some(Ok(Some((r.clone(), file_path.clone())))),
+                Err(msg) => {
+                    if entities.iter().any(|e| e.name == query.name) {
+                        if name_found_error.is_none() {
+                            name_found_error = Some(msg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If we found the name somewhere but never exact-matched, return that error
+    name_found_error.map(Err)
+}
+
+/// Generate scope-based candidate file paths (cheap, no git operations).
+/// Uses effective_scope which may be discovered from disk if query had no scope.
+fn scope_candidate_files(effective_scope: &Option<Vec<String>>, primary_file: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(primary_file.to_string());
+
+    if let Some(ref scope) = effective_scope {
+        for scope_part in scope {
+            // Handle both / and \ as path separators (Windows compatibility)
+            let dir = primary_file.rfind(|c| c == '/' || c == '\\')
+                .map(|i| &primary_file[..i])
+                .unwrap_or("");
+            let ext = primary_file.rfind('.')
+                .map(|i| &primary_file[i..])
+                .unwrap_or(".cs");
+            let sep = if primary_file.contains('\\') { "\\" } else { "/" };
+            for candidate in &[
+                format!("{}{}{}{}", dir, if dir.is_empty() { "" } else { sep }, scope_part, ext),
+                format!("{}{}{}.cs", dir, if dir.is_empty() { "" } else { sep }, scope_part),
+            ] {
+                if !candidate.is_empty() && !seen.contains(candidate) {
+                    candidates.push(candidate.clone());
+                    seen.insert(candidate.clone());
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Generate candidate files from git diff between refs (expensive).
+fn git_diff_candidate_files(
+    bridge: &GitBridge,
     primary_file: &str,
     git_ref: &str,
     other_ref: &str,
@@ -337,8 +446,6 @@ fn collect_candidate_files(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     seen.insert(primary_file.to_string());
 
-    // Strategy 1: Use git diff between the two refs to find renamed/moved files.
-    // The entity might have moved from one file to another.
     if let Ok(changes) = bridge.get_changed_files(
         &sem_core::git::types::DiffScope::Range {
             from: other_ref.to_string(),
@@ -347,34 +454,14 @@ fn collect_candidate_files(
         &[],
     ) {
         for change in &changes {
-            // Check the current file path at git_ref
             if !seen.contains(&change.file_path) {
                 candidates.push(change.file_path.clone());
                 seen.insert(change.file_path.clone());
             }
-            // Check the old file path (before rename/move)
             if let Some(ref old_path) = change.old_file_path {
                 if !seen.contains(old_path.as_str()) {
                     candidates.push(old_path.clone());
                     seen.insert(old_path.clone());
-                }
-            }
-        }
-    }
-
-    // Strategy 2: Scope-based heuristic. If query has scope like "AccountService",
-    // look for files with that name in the same directory as the primary file.
-    if let Some(ref scope) = query.scope {
-        for scope_part in scope {
-            let dir = primary_file.rfind('/').map(|i| &primary_file[..i]).unwrap_or("");
-            let ext = primary_file.rfind('.').map(|i| &primary_file[i..]).unwrap_or(".cs");
-            for candidate in &[
-                format!("{}/{}{}", dir, scope_part, ext),
-                format!("{}/{}.cs", dir, scope_part), // fallback to .cs
-            ] {
-                if !candidate.is_empty() && !seen.contains(candidate) {
-                    candidates.push(candidate.clone());
-                    seen.insert(candidate.clone());
                 }
             }
         }

@@ -90,7 +90,7 @@ pub fn log_command(opts: LogOptions) {
     // Resolve file path: use provided or auto-detect
     let file_path = match opts.file_path {
         Some(fp) => fp,
-        None => match find_entity_file(root, &registry, &query) {
+        None => match find_entity_file(root, &registry, &query, Some(&bridge)) {
             FindResult::Found(fp) => fp,
             FindResult::Ambiguous(files) => {
                 eprintln!(
@@ -1360,7 +1360,11 @@ fn search_entity_cross_file_v2(
     let exclude_normalized = exclude_file.replace('\\', "/");
     let parent_sha = bridge.get_parent_sha(sha).ok().flatten();
 
+    // Phase 1: parse only files that contain the entity name (fast pre-filter).
+    // Files without the name are deferred — pass 3 needs them for rename detection.
     let mut entity_cache: HashMap<String, Vec<SemanticEntity>> = HashMap::new();
+    let mut deferred: Vec<(String, String)> = Vec::new(); // (file_path, content) for pass 3
+
     for file_path in &changed_files {
         if file_path == &exclude_normalized {
             continue;
@@ -1385,7 +1389,11 @@ fn search_entity_cross_file_v2(
             }
         };
         if let Some(c) = content {
-            entity_cache.insert(file_path.clone(), registry.extract_entities(file_path, &c));
+            if c.contains(query_name) {
+                entity_cache.insert(file_path.clone(), registry.extract_entities(file_path, &c));
+            } else {
+                deferred.push((file_path.clone(), c));
+            }
         }
     }
 
@@ -1425,8 +1433,13 @@ fn search_entity_cross_file_v2(
         }
     }
 
-    // Pass 3: Different name + content/structure match → Moved + Renamed
+    // Pass 3: Different name + content/structure match → Moved + Renamed.
+    // Parse the deferred files (skipped by pre-filter) now.
     if prev_content_hash.is_some() || prev_structural_hash.is_some() {
+        for (file_path, content) in deferred {
+            entity_cache.insert(file_path.clone(), registry.extract_entities(&file_path, &content));
+        }
+
         for (file_path, entities) in &entity_cache {
             for ent in entities {
                 if ent.name == query_name {
@@ -1754,7 +1767,62 @@ pub fn find_entity_file(
     root: &Path,
     registry: &sem_core::parser::registry::ParserRegistry,
     query: &EntityQuery,
+    bridge: Option<&sem_core::git::bridge::GitBridge>,
 ) -> FindResult {
+    let name = &query.name;
+
+    // Fast path: use git tree + blob search (mmap, no filesystem I/O)
+    // This is faster than filesystem scope heuristic (~250ms vs ~1s) and
+    // works for all query types (with or without scope).
+    if let Some(b) = bridge {
+        let exts_owned = registry.supported_extensions();
+        let exts: Vec<&str> = exts_owned.iter().map(|s| s.as_str()).collect();
+        if let Ok(matches) = b.grep_blobs_at_ref("HEAD", name.as_str(), &exts) {
+            let mut found_in: Vec<String> = Vec::new();
+            for (file_path, content) in &matches {
+                let entities = registry.extract_entities(file_path, content);
+                let by_id: std::collections::HashMap<&str, &SemanticEntity> = entities
+                    .iter().map(|e| (e.id.as_str(), e)).collect();
+                let has_match: Vec<_> = entities.iter()
+                    .filter(|e| e.name == query.name)
+                    .filter(|e| {
+                        query.signature.as_ref().map_or(true, |sig| {
+                            e.signature.as_deref() == Some(sig.as_str())
+                        })
+                    })
+                    .filter(|e| {
+                        query.scope.as_ref().map_or(true, |scope| {
+                            super::scope_matches(e, scope, &by_id)
+                        })
+                    })
+                    .collect();
+                if !has_match.is_empty() {
+                    found_in.push(file_path.clone());
+                }
+            }
+            if !found_in.is_empty() {
+                return match found_in.len() {
+                    1 => FindResult::Found(found_in.into_iter().next().unwrap()),
+                    _ => FindResult::Ambiguous(found_in),
+                };
+            }
+        }
+        return FindResult::NotFound;
+    }
+
+    // Fallback (no bridge): if scope is provided (e.g. "LoginPlusService"), use it
+    // to guess candidate file names. For C# partial classes this catches files like
+    // LoginPlusService.cs, LoginPlusService.Dialogs.cs, etc.
+    if let Some(ref scope) = query.scope {
+        if let Some(class_name) = scope.last() {
+            let result = find_entity_in_scope_candidates(root, registry, query, class_name);
+            if let Some(r) = result {
+                return r;
+            }
+        }
+    }
+
+    // Fallback: full filesystem scan (when no bridge available)
     let ext_filter: Vec<String> = vec![];
     let files = super::graph::find_supported_files_public(root, registry, &ext_filter);
     let mut found_in: Vec<String> = Vec::new();
@@ -1766,6 +1834,11 @@ pub fn find_entity_file(
             Ok(c) => c,
             Err(_) => continue,
         };
+
+        // Fast pre-filter: skip AST parse if entity name doesn't appear in file text
+        if !content.contains(name.as_str()) {
+            continue;
+        }
 
         let entities = registry.extract_entities(file_path, &content);
         let by_id: std::collections::HashMap<&str, &SemanticEntity> = entities
@@ -1792,8 +1865,6 @@ pub fn find_entity_file(
     }
 
     // Pass 2: If not found and signature was specified, fall back to name-only search.
-    // The signature may have changed — find the file by name, then let the log
-    // tracking algorithm detect the signature change via content matching.
     if found_in.is_empty() && query.signature.is_some() {
         for file_path in &files {
             let full_path = root.join(file_path);
@@ -1801,6 +1872,10 @@ pub fn find_entity_file(
                 Ok(c) => c,
                 Err(_) => continue,
             };
+
+            if !content.contains(name.as_str()) {
+                continue;
+            }
 
             let entities = registry.extract_entities(file_path, &content);
             let by_id: std::collections::HashMap<&str, &SemanticEntity> = entities
@@ -1826,6 +1901,126 @@ pub fn find_entity_file(
         0 => FindResult::NotFound,
         1 => FindResult::Found(found_in.into_iter().next().unwrap()),
         _ => FindResult::Ambiguous(found_in),
+    }
+}
+
+/// Try to find the entity using scope-based file name heuristics.
+/// For a scope like "LoginPlusService", looks for files matching
+/// `*LoginPlusService*` in any directory. Returns None if not found
+/// (caller should fall through to full scan).
+fn find_entity_in_scope_candidates(
+    root: &Path,
+    registry: &sem_core::parser::registry::ParserRegistry,
+    query: &EntityQuery,
+    class_name: &str,
+) -> Option<FindResult> {
+    let pattern = format!("*{}*", class_name);
+    let mut candidates: Vec<String> = Vec::new();
+
+    // Walk only files matching the scope name pattern
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+        if !file_name.contains(class_name) {
+            continue;
+        }
+        if let Ok(rel) = path.strip_prefix(root) {
+            let rel_str = rel.to_string_lossy().to_string();
+            if registry.get_plugin(&rel_str).is_some() {
+                candidates.push(rel_str);
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Try exact match in these candidates
+    let mut found_in: Vec<String> = Vec::new();
+
+    for file_path in &candidates {
+        let full_path = root.join(file_path);
+        let content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        if !content.contains(query.name.as_str()) {
+            continue;
+        }
+
+        let entities = registry.extract_entities(file_path, &content);
+        let by_id: std::collections::HashMap<&str, &SemanticEntity> = entities
+            .iter()
+            .map(|e| (e.id.as_str(), e))
+            .collect();
+        let matches: Vec<_> = entities
+            .iter()
+            .filter(|e| e.name == query.name)
+            .filter(|e| {
+                query.signature.as_ref().map_or(true, |sig| {
+                    e.signature.as_deref() == Some(sig.as_str())
+                })
+            })
+            .filter(|e| {
+                query.scope.as_ref().map_or(true, |scope| {
+                    super::scope_matches(e, scope, &by_id)
+                })
+            })
+            .collect();
+        if !matches.is_empty() {
+            found_in.push(file_path.clone());
+        }
+    }
+
+    // Pass 2: name-only if nothing found with signature
+    if found_in.is_empty() && query.signature.is_some() {
+        for file_path in &candidates {
+            let full_path = root.join(file_path);
+            let content = match std::fs::read_to_string(&full_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            if !content.contains(query.name.as_str()) {
+                continue;
+            }
+
+            let entities = registry.extract_entities(file_path, &content);
+            let by_id: std::collections::HashMap<&str, &SemanticEntity> = entities
+                .iter()
+                .map(|e| (e.id.as_str(), e))
+                .collect();
+            let matches: Vec<_> = entities
+                .iter()
+                .filter(|e| e.name == query.name)
+                .filter(|e| {
+                    query.scope.as_ref().map_or(true, |scope| {
+                        super::scope_matches(e, scope, &by_id)
+                    })
+                })
+                .collect();
+            if !matches.is_empty() {
+                found_in.push(file_path.clone());
+            }
+        }
+    }
+
+    match found_in.len() {
+        0 => None, // Not in scope candidates — caller should try full scan
+        1 => Some(FindResult::Found(found_in.into_iter().next().unwrap())),
+        _ => Some(FindResult::Ambiguous(found_in)),
     }
 }
 
